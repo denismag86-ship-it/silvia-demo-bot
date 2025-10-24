@@ -22,7 +22,7 @@ SESSION_TTL_SECONDS = 3600
 # --- Инициализация FastAPI ---
 app = FastAPI()
 
-# 🔥 CORS — разрешаем запросы с вашего сайта
+# 🔥 CORS — исправлено: убраны пробелы
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -65,7 +65,7 @@ def generate_session_id(url: str) -> str:
 
 def extract_text_and_metadata(html: str, url: str):
     soup = BeautifulSoup(html, "lxml")
-    for tag in soup(["script", "style", "nav", "footer", "aside"]):
+    for tag in soup(["script", "style", "nav", "footer", "aside", "header"]):
         tag.decompose()
     title = soup.title.string if soup.title else ""
     company_name = title or url.split("//")[-1].split("/")[0]
@@ -73,6 +73,15 @@ def extract_text_and_metadata(html: str, url: str):
     text = soup.get_text(separator=" ", strip=True)
     text = re.sub(r"\s+", " ", text)
     return {"text": text, "company_name": company_name, "lang": lang}
+
+def smart_truncate(text: str, max_chars: int = 2800) -> str:
+    if len(text) <= max_chars:
+        return text
+    truncated = text[:max_chars]
+    last_end = max(truncated.rfind(". "), truncated.rfind("! "), truncated.rfind("? "))
+    if last_end != -1:
+        return truncated[:last_end + 1]
+    return truncated
 
 # --- Эндпоинты ---
 @app.post("/analyze", response_model=AnalyzeResponse)
@@ -125,23 +134,46 @@ async def chat(req: ChatRequest):
     document = results["documents"][0]
     company_name = results["metadatas"][0]["company_name"]
     lang = results["metadatas"][0]["lang"]
+
+    # Приветствие
     if lang == "en":
         welcome = f"Hi! I’m the AI assistant for {company_name}. How can I help you today?"
     else:
         welcome = f"Здравствуйте! Я — цифровой помощник компании {company_name}. Чем могу помочь?"
+
     if len(question) < 5 and any(w in question.lower() for w in ["прив", "hi", "hello", "здрав"]):
         return ChatResponse(answer=welcome)
-    context = document[:3000]
+
+    # Умная обрезка контекста
+    context = smart_truncate(document)
+
+    # 🧠 УЛУЧШЕННЫЙ СИСТЕМНЫЙ ПРОМТ
+    system_prompt = f"""Вы — Silvia, интеллектуальный цифровой сотрудник компании «{company_name}». 
+Ваша задача — отвечать от лица компании, используя ТОЛЬКО информацию с её главной страницы.
+
+Правила:
+1. Говорите дружелюбно, профессионально и с лёгкой креативностью: используйте метафоры, задавайте уточняющие вопросы, подчёркивайте выгоды.
+2. НЕ выдумывайте факты. Если информации нет — скажите: «Это не указано на сайте, но я могу уточнить у команды!»
+3. Избегайте фраз вроде «На сайте написано…». Вы — голос компании, а не парсер.
+4. Делайте ответы краткими (1–3 предложения), но содержательными.
+5. Если вопрос не по теме — мягко возвращайте в контекст: «Я помогаю с вопросами о {company_name}. Например, вы можете спросить о наших услугах или как с нами связаться.»
+
+Контекст с сайта (используйте его осмысленно, не цитируйте дословно):
+{context}
+"""
+
     messages = [
-        {"role": "system", "content": f"Вы — цифровой помощник компании {company_name}. Отвечайте ТОЛЬКО на основе контекста. Контекст: {context}"},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": question}
     ]
+
     try:
         chat_resp = await client.chat.completions.create(
             model="gpt-4o-mini",
             messages=messages,
-            temperature=0.7,
-            max_tokens=300
+            temperature=0.75,      # ↑ креативность
+            max_tokens=300,
+            top_p=0.9
         )
         answer = chat_resp.choices[0].message.content.strip()
         return ChatResponse(answer=answer)
