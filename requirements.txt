@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+httpx
+beautifulsoup4
+lxml
+openai
+chromadb==0.4.24
