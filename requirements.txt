@@ -5,3 +5,4 @@ beautifulsoup4
 lxml
 openai
 chromadb==0.4.24
+numpy==1.26.4
