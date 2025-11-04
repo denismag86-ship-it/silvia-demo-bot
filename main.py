@@ -46,9 +46,11 @@ client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 # 🔥 ChromaDB — ИСПРАВЛЕНО: используем in-memory для Render
 try:
     # In-memory режим для эфемерного хранилища Render
+    # Отключаем телеметрию чтобы убрать ошибки в логах
     chroma_client = chromadb.Client(Settings(
         anonymized_telemetry=False,
-        allow_reset=True
+        allow_reset=True,
+        chroma_telemetry_impl="none"  # Отключаем телеметрию полностью
     ))
     logger.info("✅ ChromaDB initialized (in-memory mode)")
 except Exception as e:
@@ -122,6 +124,7 @@ def smart_truncate(text: str, max_chars: int = 2800) -> str:
 
 # --- Эндпоинты ---
 @app.get("/")
+@app.head("/")
 async def root():
     """Health check endpoint"""
     return {
@@ -132,6 +135,7 @@ async def root():
     }
 
 @app.get("/health")
+@app.head("/health")
 async def health():
     """Detailed health check"""
     return {
