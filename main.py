@@ -27,7 +27,7 @@ SESSION_TTL_SECONDS = 3600
 # --- Инициализация FastAPI ---
 app = FastAPI(title="Silvia API", version="1.0.0")
 
-# 🔥 CORS — ИСПРАВЛЕНО: убраны пробелы
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -43,35 +43,34 @@ app.add_middleware(
 
 client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-# 🔥 ChromaDB — ИСПРАВЛЕНО: используем in-memory для Render
+# 🔥 ChromaDB — ИСПРАВЛЕНИЕ: Защита от потери данных при перезапуске
 try:
-    # In-memory режим для эфемерного хранилища Render
-    # Отключаем телеметрию чтобы убрать ошибки в логах
     chroma_client = chromadb.Client(Settings(
         anonymized_telemetry=False,
         allow_reset=True,
-        chroma_telemetry_impl="none"  # Отключаем телеметрию полностью
     ))
     logger.info("✅ ChromaDB initialized (in-memory mode)")
 except Exception as e:
     logger.error(f"❌ ChromaDB initialization failed: {e}")
     chroma_client = None
 
-# --- Модели ---
-class AnalyzeRequest(BaseModel):
-    url: str
-
-class AnalyzeResponse(BaseModel):
-    session_id: str
-
-class ChatRequest(BaseModel):
-    session_id: str
-    question: str
-
-class ChatResponse(BaseModel):
-    answer: str
-
 # --- Вспомогательные функции ---
+def get_collection():
+    """Безопасное получение коллекции с обработкой ошибок"""
+    if not chroma_client:
+        raise HTTPException(status_code=503, detail="ChromaDB not available")
+    
+    try:
+        return chroma_client.get_or_create_collection(name=COLLECTION_NAME)
+    except Exception as e:
+        logger.error(f"❌ Collection error: {e}")
+        # Пытаемся пересоздать коллекцию при ошибке
+        try:
+            chroma_client.delete_collection(name=COLLECTION_NAME)
+        except:
+            pass
+        return chroma_client.create_collection(name=COLLECTION_NAME)
+
 def is_valid_url(url: str) -> bool:
     try:
         result = httpx.URL(url)
@@ -86,21 +85,17 @@ def extract_main_content(html: str, url: str):
     """Извлекает только основной контент сайта, удаляя шум."""
     soup = BeautifulSoup(html, "lxml")
     
-    # Удаляем всё лишнее
     for tag in soup(["script", "style", "nav", "footer", "aside", "header", "form", "button", "img", "svg", "noscript"]):
         tag.decompose()
     
-    # Ищем основной контент
     main = soup.find("main") or soup.find("article") or soup.find("section") or soup.body
     if main:
         text = main.get_text(separator=" ", strip=True)
     else:
         text = soup.get_text(separator=" ", strip=True)
     
-    # Очищаем пробелы
     text = re.sub(r"\s+", " ", text).strip()
     
-    # Получаем название компании
     title = soup.title.string if soup.title else ""
     company_name = title or url.split("//")[-1].split("/")[0]
     lang = soup.html.get("lang", "ru") if soup.html else "ru"
@@ -138,17 +133,24 @@ async def root():
 @app.head("/health")
 async def health():
     """Detailed health check"""
+    chroma_status = "connected" if chroma_client else "disconnected"
+    
+    # Проверяем, что коллекция доступна
+    try:
+        if chroma_client:
+            collection = get_collection()
+            chroma_status = f"connected, collection: {collection.count()}"
+    except Exception as e:
+        chroma_status = f"error: {str(e)}"
+    
     return {
         "status": "healthy",
-        "chromadb": "connected" if chroma_client else "disconnected",
+        "chromadb": chroma_status,
         "openai": "configured" if OPENAI_API_KEY else "missing"
     }
 
 @app.post("/analyze", response_model=AnalyzeResponse)
 async def analyze(req: AnalyzeRequest):
-    if not chroma_client:
-        raise HTTPException(status_code=503, detail="ChromaDB not available")
-    
     url = req.url.strip()
     logger.info(f"📊 Analyzing URL: {url}")
     
@@ -188,7 +190,7 @@ async def analyze(req: AnalyzeRequest):
         logger.info(f"🧠 Embedding created: {len(embedding)} dimensions")
         
         # Сохраняем в ChromaDB
-        collection = chroma_client.get_or_create_collection(name=COLLECTION_NAME)
+        collection = get_collection()
         collection.upsert(
             ids=[session_id],
             embeddings=[embedding],
@@ -213,9 +215,6 @@ async def analyze(req: AnalyzeRequest):
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
-    if not chroma_client:
-        raise HTTPException(status_code=503, detail="ChromaDB not available")
-    
     session_id = req.session_id
     question = req.question.strip()
     
@@ -225,7 +224,7 @@ async def chat(req: ChatRequest):
         raise HTTPException(status_code=400, detail="Question is empty")
     
     try:
-        collection = chroma_client.get_or_create_collection(name=COLLECTION_NAME)
+        collection = get_collection()
         results = collection.get(ids=[session_id])
         
         if not results["ids"]:
@@ -283,3 +282,17 @@ async def chat(req: ChatRequest):
     except Exception as e:
         logger.error(f"❌ Chat error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Generation error: {str(e)}")
+
+# Модели остаются без изменений
+class AnalyzeRequest(BaseModel):
+    url: str
+
+class AnalyzeResponse(BaseModel):
+    session_id: str
+
+class ChatRequest(BaseModel):
+    session_id: str
+    question: str
+
+class ChatResponse(BaseModel):
+    answer: str
