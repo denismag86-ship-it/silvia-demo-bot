@@ -22,7 +22,7 @@ SESSION_TTL_SECONDS = 3600
 # --- Инициализация FastAPI ---
 app = FastAPI()
 
-# 🔥 CORS — исправлено: убраны пробелы
+# 🔥 CORS — исправлено: убраны лишние пробелы в URL
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -36,7 +36,17 @@ app.add_middleware(
 )
 
 client = AsyncOpenAI(api_key=OPENAI_API_KEY)
-chroma_client = chromadb.Client(Settings(anonymized_telemetry=False))
+
+# 🔥 Исправление ошибки телеметрии ChromaDB:
+# 1. Установка переменной окружения для полного отключения телеметрии
+os.environ["CHROMA_TELEMETRY"] = "false"
+
+# 2. Использование правильных настроек для отключения анонимной телеметрии
+chroma_client = chromadb.Client(Settings(
+    anonymized_telemetry=False,
+    allow_reset=False,
+    is_persistent=False
+))
 
 # --- Модели ---
 class AnalyzeRequest(BaseModel):
@@ -51,6 +61,18 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     answer: str
+
+# --- Кэш коллекции для повышения производительности ---
+_collection_cache = None
+
+def get_collection():
+    global _collection_cache
+    if _collection_cache is None:
+        try:
+            _collection_cache = chroma_client.get_collection(name=COLLECTION_NAME)
+        except:
+            _collection_cache = chroma_client.create_collection(name=COLLECTION_NAME, metadata={"hnsw:space": "cosine"})
+    return _collection_cache
 
 # --- Вспомогательные функции ---
 def is_valid_url(url: str) -> bool:
@@ -103,6 +125,20 @@ def smart_truncate(text: str, max_chars: int = 2800) -> str:
         return truncated[:last_end + 1]
     return truncated[:max_chars]  # fallback
 
+# --- Очистка старых сессий ---
+def cleanup_old_sessions(collection):
+    current_time = int(time.time())
+    results = collection.get(
+        include=["metadatas"],
+        where={"$and": [
+            {"created_at": {"$lt": current_time - SESSION_TTL_SECONDS}}
+        ]}
+    )
+    
+    if results["ids"]:
+        collection.delete(ids=results["ids"])
+        print(f"Очищено {len(results['ids'])} устаревших сессий")
+
 # --- Эндпоинты ---
 @app.post("/analyze", response_model=AnalyzeResponse)
 async def analyze(req: AnalyzeRequest):
@@ -131,7 +167,11 @@ async def analyze(req: AnalyzeRequest):
         embedding_resp = await client.embeddings.create(input=safe_text, model="text-embedding-3-small")
         embedding = embedding_resp.data[0].embedding
         
-        collection = chroma_client.get_or_create_collection(name=COLLECTION_NAME)
+        collection = get_collection()
+        
+        # Очищаем старые сессии перед добавлением новой
+        cleanup_old_sessions(collection)
+        
         collection.upsert(
             ids=[session_id],
             embeddings=[embedding],
@@ -155,8 +195,8 @@ async def chat(req: ChatRequest):
     if not question:
         raise HTTPException(status_code=400, detail="Question is empty")
     
-    collection = chroma_client.get_or_create_collection(name=COLLECTION_NAME)
-    results = collection.get(ids=[session_id])
+    collection = get_collection()
+    results = collection.get(ids=[session_id], include=["documents", "metadatas"])
     if not results["ids"]:
         raise HTTPException(status_code=404, detail="Session not found")
     
@@ -171,11 +211,11 @@ async def chat(req: ChatRequest):
 
     # Приветствие
     if lang == "en":
-        welcome = f"Hi! I’m the AI assistant for {company_name}. How can I help you today?"
+        welcome = f"Hi! I'm the AI assistant for {company_name}. How can I help you today?"
     else:
         welcome = f"Здравствуйте! Я — цифровой помощник компании {company_name}. Чем могу помочь?"
 
-    if len(question) < 5 and any(w in question.lower() for w in ["прив", "hi", "hello", "здрав"]):
+    if len(question) < 5 and any(w in question.lower() for w in ["прив", "hi", "hello", "здрав", "здар", "привет"]):
         return ChatResponse(answer=welcome)
 
     # Системный промт
@@ -208,3 +248,8 @@ async def chat(req: ChatRequest):
         return ChatResponse(answer=answer)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Generation error: {str(e)}")
+
+# --- Health check endpoint ---
+@app.get("/health")
+async def health_check():
+    return {"status": "ok", "service": "silvia-ai-demo"}
