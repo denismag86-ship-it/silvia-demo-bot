@@ -1,27 +1,20 @@
-# Полное отключение телеметрии chromadb через monkey patching
-import os
-os.environ["CHROMA_TELEMETRY"] = "false"
-os.environ["ANONYMIZED_TELEMETRY"] = "false"
-os.environ["CHROMA_DISABLE_OPENTELEMETRY"] = "true"
-os.environ["CHROMA_DISABLE_EVENTS"] = "true"
-
-# Импорты
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 from bs4 import BeautifulSoup
 import re
 import time
-import logging
 import hashlib
+import os
+import logging
 from pydantic import BaseModel
 from openai import AsyncOpenAI
 import chromadb
 from chromadb.config import Settings
 
-# Настройка логирования
+# --- Логирование ---
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("main")
+logger = logging.getLogger(__name__)
 
 # --- Конфигурация ---
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -31,32 +24,17 @@ if not OPENAI_API_KEY:
 COLLECTION_NAME = "demo_sites"
 SESSION_TTL_SECONDS = 3600
 
-# --- Полное отключение телеметрии chromadb ---
-# Monkey patching для полного отключения телеметрии
-def mock_capture(*args, **kwargs):
-    return None
-
-try:
-    # Патчим PostHog клиент для полного отключения телеметрии
-    import chromadb.telemetry.product.posthog
-    chromadb.telemetry.product.posthog.Posthog = type('MockPosthog', (), {
-        'capture': staticmethod(mock_capture),
-        '_capture': staticmethod(mock_capture),
-        '__init__': lambda *args, **kwargs: None
-    })
-except Exception as e:
-    logger.warning(f"Не удалось полностью отключить телеметрию: {str(e)}")
-
 # --- Инициализация FastAPI ---
-app = FastAPI()
+app = FastAPI(title="Silvia API", version="1.0.0")
 
-# 🔥 CORS — исправлено: убраны лишние пробелы в URL
+# 🔥 CORS — ИСПРАВЛЕНО: убраны пробелы
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://silvia-ai.ru",
         "https://www.silvia-ai.ru",
         "http://localhost:8000",
+        "http://localhost:3000",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -65,12 +43,19 @@ app.add_middleware(
 
 client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-# Инициализация ChromaDB с полным отключением телеметрии
-chroma_client = chromadb.Client(Settings(
-    anonymized_telemetry=False,
-    allow_reset=False,
-    is_persistent=False
-))
+# 🔥 ChromaDB — ИСПРАВЛЕНО: используем in-memory для Render
+try:
+    # In-memory режим для эфемерного хранилища Render
+    # Отключаем телеметрию чтобы убрать ошибки в логах
+    chroma_client = chromadb.Client(Settings(
+        anonymized_telemetry=False,
+        allow_reset=True,
+        chroma_telemetry_impl="none"  # Отключаем телеметрию полностью
+    ))
+    logger.info("✅ ChromaDB initialized (in-memory mode)")
+except Exception as e:
+    logger.error(f"❌ ChromaDB initialization failed: {e}")
+    chroma_client = None
 
 # --- Модели ---
 class AnalyzeRequest(BaseModel):
@@ -86,23 +71,6 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     answer: str
 
-# --- Кэш коллекции ---
-_collection_cache = None
-
-def get_collection():
-    global _collection_cache
-    if _collection_cache is None:
-        try:
-            logger.info(f"🔍 Получаем коллекцию: {COLLECTION_NAME}")
-            _collection_cache = chroma_client.get_collection(name=COLLECTION_NAME)
-        except:
-            logger.info(f"🆕 Создаем новую коллекцию: {COLLECTION_NAME}")
-            _collection_cache = chroma_client.create_collection(
-                name=COLLECTION_NAME,
-                metadata={"hnsw:space": "cosine"}
-            )
-    return _collection_cache
-
 # --- Вспомогательные функции ---
 def is_valid_url(url: str) -> bool:
     try:
@@ -116,7 +84,6 @@ def generate_session_id(url: str) -> str:
 
 def extract_main_content(html: str, url: str):
     """Извлекает только основной контент сайта, удаляя шум."""
-    logger.info("🧹 Извлечение основного контента...")
     soup = BeautifulSoup(html, "lxml")
     
     # Удаляем всё лишнее
@@ -138,7 +105,6 @@ def extract_main_content(html: str, url: str):
     company_name = title or url.split("//")[-1].split("/")[0]
     lang = soup.html.get("lang", "ru") if soup.html else "ru"
     
-    logger.info(f"📝 Извлечено {len(text)} символов")
     return {"text": text, "company_name": company_name, "lang": lang}
 
 def smart_truncate(text: str, max_chars: int = 2800) -> str:
@@ -154,50 +120,75 @@ def smart_truncate(text: str, max_chars: int = 2800) -> str:
     )
     if last_end != -1:
         return truncated[:last_end + 1]
-    return truncated[:max_chars]  # fallback
+    return truncated[:max_chars]
 
 # --- Эндпоинты ---
+@app.get("/")
+@app.head("/")
+async def root():
+    """Health check endpoint"""
+    return {
+        "status": "ok",
+        "service": "Silvia API",
+        "version": "1.0.0",
+        "endpoints": ["/analyze", "/chat", "/health"]
+    }
+
+@app.get("/health")
+@app.head("/health")
+async def health():
+    """Detailed health check"""
+    return {
+        "status": "healthy",
+        "chromadb": "connected" if chroma_client else "disconnected",
+        "openai": "configured" if OPENAI_API_KEY else "missing"
+    }
+
 @app.post("/analyze", response_model=AnalyzeResponse)
 async def analyze(req: AnalyzeRequest):
+    if not chroma_client:
+        raise HTTPException(status_code=503, detail="ChromaDB not available")
+    
     url = req.url.strip()
-    logger.info(f"📊 Анализ URL: {url}")
+    logger.info(f"📊 Analyzing URL: {url}")
     
     if not is_valid_url(url):
-        logger.warning(f"URLException: Неверный URL - {url}")
         raise HTTPException(status_code=400, detail="Invalid URL")
     
     session_id = generate_session_id(url)
-    logger.info(f"🆔 Сгенерирован session_id: {session_id}")
     
     try:
+        # Получаем HTML
         async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as http_client:
-            logger.info(f"🌐 Запрос к {url}")
             resp = await http_client.get(url)
             resp.raise_for_status()
             html = resp.text
-            logger.info(f"✅ HTML загружен: {len(html)} символов")
         
+        logger.info(f"✅ HTML fetched: {len(html)} chars")
+        
+        # Извлекаем контент
         data = extract_main_content(html, url)
         raw_text = data["text"]
         
-        if not raw_text or len(raw_text) < 50:
-            logger.warning(f"_ContentWarning: Недостаточно контента на сайте {url}")
+        if not raw_text:
             raise HTTPException(status_code=400, detail="No meaningful content found on the site")
+        
+        logger.info(f"📝 Extracted text: {len(raw_text)} chars")
         
         # Обрезаем до безопасного размера
         safe_text = smart_truncate(raw_text, max_chars=2800)
-        logger.info(f"✂️ Текст обрезан до: {len(safe_text)} символов")
+        logger.info(f"✂️ Truncated to: {len(safe_text)} chars")
         
         # Генерируем эмбеддинг
-        logger.info("🧠 Генерация эмбеддинга...")
-        embedding_resp = await client.embeddings.create(input=safe_text, model="text-embedding-3-small")
+        embedding_resp = await client.embeddings.create(
+            input=safe_text, 
+            model="text-embedding-3-small"
+        )
         embedding = embedding_resp.data[0].embedding
-        logger.info(f"✅ Эмбеддинг создан: {len(embedding)} измерений")
+        logger.info(f"🧠 Embedding created: {len(embedding)} dimensions")
         
-        # Работа с коллекцией
-        collection = get_collection()
-        logger.info("💾 Сохранение в коллекцию...")
-        
+        # Сохраняем в ChromaDB
+        collection = chroma_client.get_or_create_collection(name=COLLECTION_NAME)
         collection.upsert(
             ids=[session_id],
             embeddings=[embedding],
@@ -209,65 +200,57 @@ async def analyze(req: AnalyzeRequest):
                 "created_at": int(time.time())
             }]
         )
-        logger.info(f"✅ Сессия создана: {session_id}")
+        
+        logger.info(f"✅ Session created: {session_id}")
         return AnalyzeResponse(session_id=session_id)
     
+    except httpx.HTTPError as e:
+        logger.error(f"❌ HTTP error: {e}")
+        raise HTTPException(status_code=502, detail=f"Failed to fetch URL: {str(e)}")
     except Exception as e:
-        error_detail = str(e)
-        logger.error(f"❌ Ошибка при анализе: {error_detail}")
-        
-        # Специальная обработка ошибок сети
-        if "timeout" in error_detail.lower() or "connect" in error_detail.lower():
-            error_detail = "Сайт не отвечает или слишком медленно загружается. Попробуйте позже."
-        elif "status code 4" in error_detail.lower() or "status code 5" in error_detail.lower():
-            error_detail = "Не удалось получить доступ к сайту. Убедитесь, что сайт доступен из интернета."
-        
-        raise HTTPException(status_code=500, detail=f"Ошибка анализа сайта: {error_detail}")
+        logger.error(f"❌ Analysis error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Analysis error: {str(e)}")
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
+    if not chroma_client:
+        raise HTTPException(status_code=503, detail="ChromaDB not available")
+    
     session_id = req.session_id
     question = req.question.strip()
-    logger.info(f"💬 Чат-запрос для сессии {session_id}: '{question[:50]}...'")
+    
+    logger.info(f"💬 Chat request: session={session_id}, question={question[:50]}...")
     
     if not question:
-        logger.warning("⚠️ Пустой вопрос")
         raise HTTPException(status_code=400, detail="Question is empty")
     
     try:
-        collection = get_collection()
-        results = collection.get(ids=[session_id], include=["documents", "metadatas"])
-    except Exception as e:
-        logger.error(f"❌ Ошибка доступа к коллекции: {str(e)}")
-        raise HTTPException(status_code=500, detail="Ошибка базы данных")
-    
-    if not results["ids"]:
-        logger.warning(f"⚠️ Сессия не найдена: {session_id}")
-        raise HTTPException(status_code=404, detail="Session not found")
-    
-    created_at = results["metadatas"][0]["created_at"]
-    if time.time() - created_at > SESSION_TTL_SECONDS:
-        collection.delete(ids=[session_id])
-        logger.info(f"🧹 Удалена устаревшая сессия: {session_id}")
-        raise HTTPException(status_code=410, detail="Session expired")
-    
-    document = results["documents"][0]
-    company_name = results["metadatas"][0]["company_name"]
-    lang = results["metadatas"][0]["lang"]
-    logger.info(f"🏢 Компания: {company_name}, Язык: {lang}")
+        collection = chroma_client.get_or_create_collection(name=COLLECTION_NAME)
+        results = collection.get(ids=[session_id])
+        
+        if not results["ids"]:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        created_at = results["metadatas"][0]["created_at"]
+        if time.time() - created_at > SESSION_TTL_SECONDS:
+            collection.delete(ids=[session_id])
+            raise HTTPException(status_code=410, detail="Session expired")
+        
+        document = results["documents"][0]
+        company_name = results["metadatas"][0]["company_name"]
+        lang = results["metadatas"][0]["lang"]
 
-    # Приветствие
-    if lang == "en":
-        welcome = f"Hi! I'm the AI assistant for {company_name}. How can I help you today?"
-    else:
-        welcome = f"Здравствуйте! Я — цифровой помощник компании {company_name}. Чем могу помочь?"
+        # Приветствие
+        if lang == "en":
+            welcome = f"Hi! I'm the AI assistant for {company_name}. How can I help you today?"
+        else:
+            welcome = f"Здравствуйте! Я — цифровой помощник компании {company_name}. Чем могу помочь?"
 
-    if len(question) < 5 and any(w in question.lower() for w in ["прив", "hi", "hello", "здрав", "здар", "привет", "ку"]):
-        logger.info("👋 Обнаружено приветствие")
-        return ChatResponse(answer=welcome)
+        if len(question) < 5 and any(w in question.lower() for w in ["прив", "hi", "hello", "здрав"]):
+            return ChatResponse(answer=welcome)
 
-    # Системный промт
-    system_prompt = f"""Вы — Silvia, интеллектуальный цифровой сотрудник компании «{company_name}». 
+        # Системный промт
+        system_prompt = f"""Вы — Silvia, интеллектуальный цифровой сотрудник компании «{company_name}». 
 Ваша задача — отвечать от лица компании, используя ТОЛЬКО информацию с её главной страницы.
 
 Правила:
@@ -281,8 +264,6 @@ async def chat(req: ChatRequest):
 {document}
 """
 
-    try:
-        logger.info("🤖 Генерация ответа...")
         chat_resp = await client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
@@ -294,39 +275,11 @@ async def chat(req: ChatRequest):
             top_p=0.9
         )
         answer = chat_resp.choices[0].message.content.strip()
-        logger.info(f"✅ Ответ сгенерирован: '{answer[:50]}...'")
+        logger.info(f"✅ Answer generated: {len(answer)} chars")
         return ChatResponse(answer=answer)
-    except Exception as e:
-        error_detail = str(e)
-        logger.error(f"❌ Ошибка генерации: {error_detail}")
         
-        if "APIConnectionError" in error_detail:
-            error_detail = "Сервис временно недоступен. Попробуйте позже."
-        elif "AuthenticationError" in error_detail:
-            error_detail = "Ошибка аутентификации сервиса. Обратитесь к администратору."
-        
-        raise HTTPException(status_code=500, detail=f"Ошибка генерации ответа: {error_detail}")
-
-# --- Health check endpoint ---
-@app.get("/health")
-async def health_check():
-    logger.info("❤️ Health check запрошен")
-    chroma_status = "ok"
-    try:
-        collection = get_collection()
-        chroma_status = f"ok (count: {collection.count()})"
+    except HTTPException:
+        raise
     except Exception as e:
-        chroma_status = f"error: {str(e)}"
-    
-    return {
-        "status": "ok", 
-        "service": "silvia-ai-demo",
-        "chroma_db": chroma_status,
-        "openai_api_key_present": bool(OPENAI_API_KEY),
-        "timestamp": int(time.time())
-    }
-
-@app.get("/")
-async def root():
-    return {"message": "Silvia AI Demo API", "version": "1.0"}
-
+        logger.error(f"❌ Chat error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Generation error: {str(e)}")
