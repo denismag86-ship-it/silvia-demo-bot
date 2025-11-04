@@ -1,3 +1,12 @@
+# --- УСТАНОВКА ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ДО ИМПОРТА CHROMADB ---
+import os
+os.environ["CHROMA_TELEMETRY"] = "false"
+os.environ["ANONYMIZED_TELEMETRY"] = "false"
+
+# Также отключаем другие возможные источники телеметрии
+os.environ["CHROMA_DISABLE_OPENTELEMETRY"] = "true"
+os.environ["CHROMA_DISABLE_EVENTS"] = "true"
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
@@ -5,11 +14,10 @@ from bs4 import BeautifulSoup
 import re
 import time
 import hashlib
-import os
-from pydantic import BaseModel
-from openai import AsyncOpenAI
 import chromadb
 from chromadb.config import Settings
+from pydantic import BaseModel
+from openai import AsyncOpenAI
 
 # --- Конфигурация ---
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -37,16 +45,18 @@ app.add_middleware(
 
 client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-# 🔥 Исправление ошибки телеметрии ChromaDB:
-# 1. Установка переменной окружения для полного отключения телеметрии
-os.environ["CHROMA_TELEMETRY"] = "false"
-
-# 2. Использование правильных настроек для отключения анонимной телеметрии
-chroma_client = chromadb.Client(Settings(
-    anonymized_telemetry=False,
-    allow_reset=False,
-    is_persistent=False
-))
+# --- Инициализация ChromaDB с максимальным отключением телеметрии ---
+try:
+    chroma_client = chromadb.Client(Settings(
+        anonymized_telemetry=False,
+        allow_reset=False,
+        is_persistent=False,
+        chroma_api_impl="rest",
+        chroma_server_host="localhost"
+    ))
+except Exception as e:
+    print(f"Предупреждение: ChromaDB инициализирован с ошибкой: {str(e)}")
+    chroma_client = None
 
 # --- Модели ---
 class AnalyzeRequest(BaseModel):
@@ -67,11 +77,24 @@ _collection_cache = None
 
 def get_collection():
     global _collection_cache
-    if _collection_cache is None:
+    if _collection_cache is not None:
+        return _collection_cache
+    
+    try:
+        # Пытаемся получить существующую коллекцию
+        _collection_cache = chroma_client.get_collection(name=COLLECTION_NAME)
+    except:
         try:
-            _collection_cache = chroma_client.get_collection(name=COLLECTION_NAME)
-        except:
-            _collection_cache = chroma_client.create_collection(name=COLLECTION_NAME, metadata={"hnsw:space": "cosine"})
+            # Если коллекции нет - создаём новую
+            _collection_cache = chroma_client.create_collection(
+                name=COLLECTION_NAME, 
+                metadata={"hnsw:space": "cosine"}
+            )
+        except Exception as e:
+            raise HTTPException(
+                status_code=500, 
+                detail=f"Ошибка инициализации базы знаний: {str(e)}"
+            )
     return _collection_cache
 
 # --- Вспомогательные функции ---
@@ -125,20 +148,6 @@ def smart_truncate(text: str, max_chars: int = 2800) -> str:
         return truncated[:last_end + 1]
     return truncated[:max_chars]  # fallback
 
-# --- Очистка старых сессий ---
-def cleanup_old_sessions(collection):
-    current_time = int(time.time())
-    results = collection.get(
-        include=["metadatas"],
-        where={"$and": [
-            {"created_at": {"$lt": current_time - SESSION_TTL_SECONDS}}
-        ]}
-    )
-    
-    if results["ids"]:
-        collection.delete(ids=results["ids"])
-        print(f"Очищено {len(results['ids'])} устаревших сессий")
-
 # --- Эндпоинты ---
 @app.post("/analyze", response_model=AnalyzeResponse)
 async def analyze(req: AnalyzeRequest):
@@ -160,17 +169,20 @@ async def analyze(req: AnalyzeRequest):
         if not raw_text:
             raise HTTPException(status_code=400, detail="No meaningful content found on the site")
         
-        # 🔥 Ключевое изменение: обрезаем до безопасного размера
+        # Обрезаем до безопасного размера
         safe_text = smart_truncate(raw_text, max_chars=2800)
         
         # Генерируем эмбеддинг
         embedding_resp = await client.embeddings.create(input=safe_text, model="text-embedding-3-small")
         embedding = embedding_resp.data[0].embedding
         
-        collection = get_collection()
-        
-        # Очищаем старые сессии перед добавлением новой
-        cleanup_old_sessions(collection)
+        try:
+            collection = get_collection()
+        except Exception as e:
+            # Повторная попытка инициализации при ошибке
+            global _collection_cache
+            _collection_cache = None
+            collection = get_collection()
         
         collection.upsert(
             ids=[session_id],
@@ -186,7 +198,14 @@ async def analyze(req: AnalyzeRequest):
         return AnalyzeResponse(session_id=session_id)
     
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Analysis error: {str(e)}")
+        error_detail = str(e)
+        # Скрываем детали внутренних ошибок для безопасности
+        if "APIConnectionError" in error_detail:
+            error_detail = "Ошибка подключения к сервису обработки данных. Попробуйте позже."
+        elif "AuthenticationError" in error_detail:
+            error_detail = "Ошибка аутентификации сервиса. Обратитесь к администратору."
+        
+        raise HTTPException(status_code=500, detail=f"Ошибка анализа сайта: {error_detail}")
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
@@ -195,8 +214,12 @@ async def chat(req: ChatRequest):
     if not question:
         raise HTTPException(status_code=400, detail="Question is empty")
     
-    collection = get_collection()
-    results = collection.get(ids=[session_id], include=["documents", "metadatas"])
+    try:
+        collection = get_collection()
+        results = collection.get(ids=[session_id], include=["documents", "metadatas"])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ошибка доступа к данным сессии: {str(e)}")
+    
     if not results["ids"]:
         raise HTTPException(status_code=404, detail="Session not found")
     
@@ -247,9 +270,24 @@ async def chat(req: ChatRequest):
         answer = chat_resp.choices[0].message.content.strip()
         return ChatResponse(answer=answer)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Generation error: {str(e)}")
+        error_detail = str(e)
+        if "APIConnectionError" in error_detail:
+            error_detail = "Ошибка подключения к сервису генерации ответов. Попробуйте позже."
+        raise HTTPException(status_code=500, detail=f"Ошибка генерации ответа: {error_detail}")
 
 # --- Health check endpoint ---
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "service": "silvia-ai-demo"}
+    chroma_status = "ok"
+    try:
+        collection = get_collection()
+        collection.count()
+    except Exception as e:
+        chroma_status = f"error: {str(e)}"
+    
+    return {
+        "status": "ok", 
+        "service": "silvia-ai-demo",
+        "chroma_db": chroma_status,
+        "openai_api_key_present": bool(OPENAI_API_KEY)
+    }
