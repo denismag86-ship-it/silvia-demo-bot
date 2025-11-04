@@ -1,12 +1,3 @@
-# --- УСТАНОВКА ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ДО ИМПОРТА CHROMADB ---
-import os
-os.environ["CHROMA_TELEMETRY"] = "false"
-os.environ["ANONYMIZED_TELEMETRY"] = "false"
-
-# Также отключаем другие возможные источники телеметрии
-os.environ["CHROMA_DISABLE_OPENTELEMETRY"] = "true"
-os.environ["CHROMA_DISABLE_EVENTS"] = "true"
-
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
@@ -14,10 +5,11 @@ from bs4 import BeautifulSoup
 import re
 import time
 import hashlib
-import chromadb
-from chromadb.config import Settings
+import os
 from pydantic import BaseModel
 from openai import AsyncOpenAI
+import chromadb
+from chromadb.config import Settings
 
 # --- Конфигурация ---
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -30,12 +22,12 @@ SESSION_TTL_SECONDS = 3600
 # --- Инициализация FastAPI ---
 app = FastAPI()
 
-# 🔥 CORS — исправлено: убраны лишние пробелы в URL
+# 🔥 CORS — исправлено: убраны пробелы
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://silvia-ai.ru",
-        "https://www.silvia-ai.ru",
+        "https://silvia-ai.ru  ",
+        "https://www.silvia-ai.ru  ",
         "http://localhost:8000",
     ],
     allow_credentials=True,
@@ -44,19 +36,7 @@ app.add_middleware(
 )
 
 client = AsyncOpenAI(api_key=OPENAI_API_KEY)
-
-# --- Инициализация ChromaDB с максимальным отключением телеметрии ---
-try:
-    chroma_client = chromadb.Client(Settings(
-        anonymized_telemetry=False,
-        allow_reset=False,
-        is_persistent=False,
-        chroma_api_impl="rest",
-        chroma_server_host="localhost"
-    ))
-except Exception as e:
-    print(f"Предупреждение: ChromaDB инициализирован с ошибкой: {str(e)}")
-    chroma_client = None
+chroma_client = chromadb.Client(Settings(anonymized_telemetry=False))
 
 # --- Модели ---
 class AnalyzeRequest(BaseModel):
@@ -71,31 +51,6 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     answer: str
-
-# --- Кэш коллекции для повышения производительности ---
-_collection_cache = None
-
-def get_collection():
-    global _collection_cache
-    if _collection_cache is not None:
-        return _collection_cache
-    
-    try:
-        # Пытаемся получить существующую коллекцию
-        _collection_cache = chroma_client.get_collection(name=COLLECTION_NAME)
-    except:
-        try:
-            # Если коллекции нет - создаём новую
-            _collection_cache = chroma_client.create_collection(
-                name=COLLECTION_NAME, 
-                metadata={"hnsw:space": "cosine"}
-            )
-        except Exception as e:
-            raise HTTPException(
-                status_code=500, 
-                detail=f"Ошибка инициализации базы знаний: {str(e)}"
-            )
-    return _collection_cache
 
 # --- Вспомогательные функции ---
 def is_valid_url(url: str) -> bool:
@@ -169,21 +124,14 @@ async def analyze(req: AnalyzeRequest):
         if not raw_text:
             raise HTTPException(status_code=400, detail="No meaningful content found on the site")
         
-        # Обрезаем до безопасного размера
+        # 🔥 Ключевое изменение: обрезаем до безопасного размера
         safe_text = smart_truncate(raw_text, max_chars=2800)
         
         # Генерируем эмбеддинг
         embedding_resp = await client.embeddings.create(input=safe_text, model="text-embedding-3-small")
         embedding = embedding_resp.data[0].embedding
         
-        try:
-            collection = get_collection()
-        except Exception as e:
-            # Повторная попытка инициализации при ошибке
-            global _collection_cache
-            _collection_cache = None
-            collection = get_collection()
-        
+        collection = chroma_client.get_or_create_collection(name=COLLECTION_NAME)
         collection.upsert(
             ids=[session_id],
             embeddings=[embedding],
@@ -198,14 +146,7 @@ async def analyze(req: AnalyzeRequest):
         return AnalyzeResponse(session_id=session_id)
     
     except Exception as e:
-        error_detail = str(e)
-        # Скрываем детали внутренних ошибок для безопасности
-        if "APIConnectionError" in error_detail:
-            error_detail = "Ошибка подключения к сервису обработки данных. Попробуйте позже."
-        elif "AuthenticationError" in error_detail:
-            error_detail = "Ошибка аутентификации сервиса. Обратитесь к администратору."
-        
-        raise HTTPException(status_code=500, detail=f"Ошибка анализа сайта: {error_detail}")
+        raise HTTPException(status_code=500, detail=f"Analysis error: {str(e)}")
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
@@ -214,12 +155,8 @@ async def chat(req: ChatRequest):
     if not question:
         raise HTTPException(status_code=400, detail="Question is empty")
     
-    try:
-        collection = get_collection()
-        results = collection.get(ids=[session_id], include=["documents", "metadatas"])
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Ошибка доступа к данным сессии: {str(e)}")
-    
+    collection = chroma_client.get_or_create_collection(name=COLLECTION_NAME)
+    results = collection.get(ids=[session_id])
     if not results["ids"]:
         raise HTTPException(status_code=404, detail="Session not found")
     
@@ -234,11 +171,11 @@ async def chat(req: ChatRequest):
 
     # Приветствие
     if lang == "en":
-        welcome = f"Hi! I'm the AI assistant for {company_name}. How can I help you today?"
+        welcome = f"Hi! I’m the AI assistant for {company_name}. How can I help you today?"
     else:
         welcome = f"Здравствуйте! Я — цифровой помощник компании {company_name}. Чем могу помочь?"
 
-    if len(question) < 5 and any(w in question.lower() for w in ["прив", "hi", "hello", "здрав", "здар", "привет"]):
+    if len(question) < 5 and any(w in question.lower() for w in ["прив", "hi", "hello", "здрав"]):
         return ChatResponse(answer=welcome)
 
     # Системный промт
@@ -270,24 +207,4 @@ async def chat(req: ChatRequest):
         answer = chat_resp.choices[0].message.content.strip()
         return ChatResponse(answer=answer)
     except Exception as e:
-        error_detail = str(e)
-        if "APIConnectionError" in error_detail:
-            error_detail = "Ошибка подключения к сервису генерации ответов. Попробуйте позже."
-        raise HTTPException(status_code=500, detail=f"Ошибка генерации ответа: {error_detail}")
-
-# --- Health check endpoint ---
-@app.get("/health")
-async def health_check():
-    chroma_status = "ok"
-    try:
-        collection = get_collection()
-        collection.count()
-    except Exception as e:
-        chroma_status = f"error: {str(e)}"
-    
-    return {
-        "status": "ok", 
-        "service": "silvia-ai-demo",
-        "chroma_db": chroma_status,
-        "openai_api_key_present": bool(OPENAI_API_KEY)
-    }
+        raise HTTPException(status_code=500, detail=f"Generation error: {str(e)}")
