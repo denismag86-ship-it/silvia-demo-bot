@@ -6,10 +6,15 @@ import re
 import time
 import hashlib
 import os
+import logging
 from pydantic import BaseModel
 from openai import AsyncOpenAI
 import chromadb
 from chromadb.config import Settings
+
+# --- Логирование ---
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # --- Конфигурация ---
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -20,15 +25,16 @@ COLLECTION_NAME = "demo_sites"
 SESSION_TTL_SECONDS = 3600
 
 # --- Инициализация FastAPI ---
-app = FastAPI()
+app = FastAPI(title="Silvia API", version="1.0.0")
 
-# 🔥 CORS — исправлено: убраны пробелы
+# 🔥 CORS — ИСПРАВЛЕНО: убраны пробелы
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://silvia-ai.ru  ",
-        "https://www.silvia-ai.ru  ",
+        "https://silvia-ai.ru",
+        "https://www.silvia-ai.ru",
         "http://localhost:8000",
+        "http://localhost:3000",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -36,7 +42,18 @@ app.add_middleware(
 )
 
 client = AsyncOpenAI(api_key=OPENAI_API_KEY)
-chroma_client = chromadb.Client(Settings(anonymized_telemetry=False))
+
+# 🔥 ChromaDB — ИСПРАВЛЕНО: используем in-memory для Render
+try:
+    # In-memory режим для эфемерного хранилища Render
+    chroma_client = chromadb.Client(Settings(
+        anonymized_telemetry=False,
+        allow_reset=True
+    ))
+    logger.info("✅ ChromaDB initialized (in-memory mode)")
+except Exception as e:
+    logger.error(f"❌ ChromaDB initialization failed: {e}")
+    chroma_client = None
 
 # --- Модели ---
 class AnalyzeRequest(BaseModel):
@@ -101,36 +118,72 @@ def smart_truncate(text: str, max_chars: int = 2800) -> str:
     )
     if last_end != -1:
         return truncated[:last_end + 1]
-    return truncated[:max_chars]  # fallback
+    return truncated[:max_chars]
 
 # --- Эндпоинты ---
+@app.get("/")
+async def root():
+    """Health check endpoint"""
+    return {
+        "status": "ok",
+        "service": "Silvia API",
+        "version": "1.0.0",
+        "endpoints": ["/analyze", "/chat", "/health"]
+    }
+
+@app.get("/health")
+async def health():
+    """Detailed health check"""
+    return {
+        "status": "healthy",
+        "chromadb": "connected" if chroma_client else "disconnected",
+        "openai": "configured" if OPENAI_API_KEY else "missing"
+    }
+
 @app.post("/analyze", response_model=AnalyzeResponse)
 async def analyze(req: AnalyzeRequest):
+    if not chroma_client:
+        raise HTTPException(status_code=503, detail="ChromaDB not available")
+    
     url = req.url.strip()
+    logger.info(f"📊 Analyzing URL: {url}")
+    
     if not is_valid_url(url):
         raise HTTPException(status_code=400, detail="Invalid URL")
     
     session_id = generate_session_id(url)
     
     try:
+        # Получаем HTML
         async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as http_client:
             resp = await http_client.get(url)
             resp.raise_for_status()
             html = resp.text
         
+        logger.info(f"✅ HTML fetched: {len(html)} chars")
+        
+        # Извлекаем контент
         data = extract_main_content(html, url)
         raw_text = data["text"]
         
         if not raw_text:
             raise HTTPException(status_code=400, detail="No meaningful content found on the site")
         
-        # 🔥 Ключевое изменение: обрезаем до безопасного размера
+        logger.info(f"📝 Extracted text: {len(raw_text)} chars")
+        
+        # Обрезаем до безопасного размера
         safe_text = smart_truncate(raw_text, max_chars=2800)
+        logger.info(f"✂️ Truncated to: {len(safe_text)} chars")
         
         # Генерируем эмбеддинг
-        embedding_resp = await client.embeddings.create(input=safe_text, model="text-embedding-3-small")
+        embedding_resp = await client.embeddings.create(
+            input=safe_text, 
+            model="text-embedding-3-small"
+        )
         embedding = embedding_resp.data[0].embedding
+        logger.info(f"🧠 Embedding created: {len(embedding)} dimensions")
         
+        # Сохраняем в ChromaDB
         collection = chroma_client.get_or_create_collection(name=COLLECTION_NAME)
         collection.upsert(
             ids=[session_id],
@@ -143,43 +196,57 @@ async def analyze(req: AnalyzeRequest):
                 "created_at": int(time.time())
             }]
         )
+        
+        logger.info(f"✅ Session created: {session_id}")
         return AnalyzeResponse(session_id=session_id)
     
+    except httpx.HTTPError as e:
+        logger.error(f"❌ HTTP error: {e}")
+        raise HTTPException(status_code=502, detail=f"Failed to fetch URL: {str(e)}")
     except Exception as e:
+        logger.error(f"❌ Analysis error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Analysis error: {str(e)}")
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
+    if not chroma_client:
+        raise HTTPException(status_code=503, detail="ChromaDB not available")
+    
     session_id = req.session_id
     question = req.question.strip()
+    
+    logger.info(f"💬 Chat request: session={session_id}, question={question[:50]}...")
+    
     if not question:
         raise HTTPException(status_code=400, detail="Question is empty")
     
-    collection = chroma_client.get_or_create_collection(name=COLLECTION_NAME)
-    results = collection.get(ids=[session_id])
-    if not results["ids"]:
-        raise HTTPException(status_code=404, detail="Session not found")
-    
-    created_at = results["metadatas"][0]["created_at"]
-    if time.time() - created_at > SESSION_TTL_SECONDS:
-        collection.delete(ids=[session_id])
-        raise HTTPException(status_code=410, detail="Session expired")
-    
-    document = results["documents"][0]
-    company_name = results["metadatas"][0]["company_name"]
-    lang = results["metadatas"][0]["lang"]
+    try:
+        collection = chroma_client.get_or_create_collection(name=COLLECTION_NAME)
+        results = collection.get(ids=[session_id])
+        
+        if not results["ids"]:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        created_at = results["metadatas"][0]["created_at"]
+        if time.time() - created_at > SESSION_TTL_SECONDS:
+            collection.delete(ids=[session_id])
+            raise HTTPException(status_code=410, detail="Session expired")
+        
+        document = results["documents"][0]
+        company_name = results["metadatas"][0]["company_name"]
+        lang = results["metadatas"][0]["lang"]
 
-    # Приветствие
-    if lang == "en":
-        welcome = f"Hi! I’m the AI assistant for {company_name}. How can I help you today?"
-    else:
-        welcome = f"Здравствуйте! Я — цифровой помощник компании {company_name}. Чем могу помочь?"
+        # Приветствие
+        if lang == "en":
+            welcome = f"Hi! I'm the AI assistant for {company_name}. How can I help you today?"
+        else:
+            welcome = f"Здравствуйте! Я — цифровой помощник компании {company_name}. Чем могу помочь?"
 
-    if len(question) < 5 and any(w in question.lower() for w in ["прив", "hi", "hello", "здрав"]):
-        return ChatResponse(answer=welcome)
+        if len(question) < 5 and any(w in question.lower() for w in ["прив", "hi", "hello", "здрав"]):
+            return ChatResponse(answer=welcome)
 
-    # Системный промт
-    system_prompt = f"""Вы — Silvia, интеллектуальный цифровой сотрудник компании «{company_name}». 
+        # Системный промт
+        system_prompt = f"""Вы — Silvia, интеллектуальный цифровой сотрудник компании «{company_name}». 
 Ваша задача — отвечать от лица компании, используя ТОЛЬКО информацию с её главной страницы.
 
 Правила:
@@ -193,7 +260,6 @@ async def chat(req: ChatRequest):
 {document}
 """
 
-    try:
         chat_resp = await client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
@@ -205,6 +271,11 @@ async def chat(req: ChatRequest):
             top_p=0.9
         )
         answer = chat_resp.choices[0].message.content.strip()
+        logger.info(f"✅ Answer generated: {len(answer)} chars")
         return ChatResponse(answer=answer)
+        
+    except HTTPException:
+        raise
     except Exception as e:
+        logger.error(f"❌ Chat error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Generation error: {str(e)}")
