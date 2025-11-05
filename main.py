@@ -1,7 +1,6 @@
 import os
 import re
 import time
-import json
 import logging
 from typing import Optional
 
@@ -79,7 +78,7 @@ def is_valid_url(url: str) -> bool:
         return False
 
 def extract_main_content(html: str, url: str):
-    # Фолбэк парсера
+    """Извлечение основного контента из HTML"""
     try:
         soup = BeautifulSoup(html, "lxml")
     except Exception:
@@ -89,25 +88,35 @@ def extract_main_content(html: str, url: str):
     for tag in soup(["script", "style", "nav", "footer", "aside", "header", "form", "button", "img", "svg", "noscript"]):
         tag.decompose()
 
-    main = soup.find("main") or soup.find("article") or soup.find("section") or (soup.body if soup else None)
+    # Ищем основной контент
+    main = soup.find("main") or soup.find("article") or soup.find("section") or soup.find("div", class_=re.compile(r"content|main", re.I))
+    if not main and soup.body:
+        main = soup.body
+    
     text = (main or soup).get_text(separator=" ", strip=True) if soup else ""
     text = re.sub(r"\s+", " ", text).strip()
 
+    # Извлекаем название компании
     title = ""
     if soup and soup.title and soup.title.string:
         title = soup.title.string.strip()
-    company_name = title or url.split("//")[-1].split("/")[0]
+    
+    company_name = title if title else url.split("//")[-1].split("/")[0]
 
+    # Определяем язык
     lang = "ru"
-    if soup and soup.html and soup.html.get("lang"):
-        lang = soup.html.get("lang").lower()
-    lang = lang.split("-")[0]  # en-US -> en
+    if soup and soup.html:
+        html_lang = soup.html.get("lang")
+        if html_lang:
+            lang = html_lang.lower().split("-")[0]
 
     return {"text": text, "company_name": company_name, "lang": lang}
 
 def smart_truncate(text: str, max_chars: int = 2800) -> str:
+    """Умное обрезание текста по границам предложений"""
     if len(text) <= max_chars:
         return text
+    
     truncated = text[:max_chars]
     last_end = max(
         truncated.rfind(". "),
@@ -115,77 +124,112 @@ def smart_truncate(text: str, max_chars: int = 2800) -> str:
         truncated.rfind("? "),
         truncated.rfind(".\n"),
     )
+    
     if last_end != -1:
         return truncated[:last_end + 1]
     return truncated[:max_chars]
 
 UA_LIST = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
 ]
 
 async def fetch_html_best_effort(url: str) -> tuple[str, str]:
     """
-    Возвращает (html, final_url). Несколько UA + https->http + r.jina.ai fallback (опционально).
+    Возвращает (html, final_url). Несколько попыток с разными UA.
     """
-    async with httpx.AsyncClient(timeout=25.0, follow_redirects=True, http2=True) as http_client:
-        # 1) Несколько UA
+    async with httpx.AsyncClient(
+        timeout=30.0, 
+        follow_redirects=True,
+        verify=False  # Для сайтов с проблемными SSL
+    ) as http_client:
+        
+        # Попытка 1: Несколько User-Agent
         for ua in UA_LIST:
             headers = {
                 "User-Agent": ua,
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "ru,en;q=0.9",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Accept-Encoding": "gzip, deflate, br",
                 "Cache-Control": "no-cache",
                 "Pragma": "no-cache",
+                "Connection": "keep-alive",
             }
             try:
+                logger.info(f"Попытка загрузки с UA: {ua[:50]}...")
                 r = await http_client.get(url, headers=headers)
+                
+                if r.status_code == 200 and r.text.strip():
+                    logger.info(f"✅ Успешная загрузка: {url}")
+                    return r.text, str(r.url)
+                
                 if r.status_code < 400 and r.text.strip():
-                    return r.text, url
-                if r.status_code in (401, 403, 406, 429):
-                    continue
-            except Exception:
+                    logger.info(f"✅ Загрузка с кодом {r.status_code}: {url}")
+                    return r.text, str(r.url)
+                
+                logger.warning(f"❌ Статус {r.status_code} для {url}")
+                
+            except httpx.TimeoutException:
+                logger.warning(f"⏱️ Таймаут для {url} с UA {ua[:30]}...")
+                continue
+            except Exception as e:
+                logger.warning(f"❌ Ошибка для {url}: {str(e)[:100]}")
                 continue
 
-        # 2) http fallback
+        # Попытка 2: HTTP fallback (если был HTTPS)
         if url.startswith("https://"):
-            alt = "http://" + url[len("https://"):]
-            for ua in UA_LIST:
+            alt_url = url.replace("https://", "http://", 1)
+            logger.info(f"Попытка HTTP fallback: {alt_url}")
+            
+            try:
                 headers = {
-                    "User-Agent": ua,
+                    "User-Agent": UA_LIST[0],
                     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                    "Accept-Language": "ru,en;q=0.9",
                 }
-                try:
-                    r = await http_client.get(alt, headers=headers)
-                    if r.status_code < 400 and r.text.strip():
-                        return r.text, alt
-                except Exception:
-                    continue
+                r = await http_client.get(alt_url, headers=headers)
+                if r.status_code < 400 and r.text.strip():
+                    logger.info(f"✅ HTTP fallback успешен: {alt_url}")
+                    return r.text, alt_url
+            except Exception as e:
+                logger.warning(f"❌ HTTP fallback failed: {str(e)[:100]}")
 
-        # 3) r.jina.ai fallback (возвращает уже текст)
+        # Попытка 3: Jina AI Reader (если включен)
         if ALLOW_JINA_FALLBACK:
             try:
-                from urllib.parse import urlparse
-                u = urlparse(url)
-                jina_url = f"https://r.jina.ai/http://{u.netloc}{u.path}{'?' + u.query if u.query else ''}"
-                jr = await http_client.get(jina_url, headers={"User-Agent": UA_LIST[0]})
+                logger.info(f"Попытка Jina AI fallback для {url}")
+                jina_url = f"https://r.jina.ai/{url}"
+                
+                headers = {"User-Agent": UA_LIST[0]}
+                jr = await http_client.get(jina_url, headers=headers, timeout=30.0)
+                
                 if jr.status_code < 400 and jr.text.strip():
-                    safe = jr.text.replace("<", "&lt;").replace(">", "&gt;")
-                    html = f"<html><body><main>{safe}</main></body></html>"
+                    logger.info(f"✅ Jina AI fallback успешен")
+                    # Оборачиваем текст в HTML
+                    safe_text = jr.text.replace("<", "&lt;").replace(">", "&gt;")
+                    html = f"<html><head><title>Content</title></head><body><main>{safe_text}</main></body></html>"
                     return html, url
-            except Exception:
-                pass
+                    
+            except Exception as e:
+                logger.warning(f"❌ Jina fallback failed: {str(e)[:100]}")
 
-    # Если не получилось — вернем 403 для понятного UX
-    raise HTTPException(status_code=403, detail="Сайт отклонил запросы (403). Попробуйте другой URL или прокси.")
+    # Все попытки провалились
+    logger.error(f"❌ Не удалось загрузить {url} ни одним способом")
+    raise HTTPException(
+        status_code=403, 
+        detail="Не удалось загрузить сайт. Возможно, он блокирует автоматические запросы."
+    )
 
 # --- Эндпоинты ---
 @app.get("/")
 @app.head("/")
 async def root():
-    return {"status": "ok", "service": "Silvia API (stateless)", "version": "2.0.0", "endpoints": ["/analyze", "/chat", "/health"]}
+    return {
+        "status": "ok", 
+        "service": "Silvia API (stateless)", 
+        "version": "2.0.0", 
+        "endpoints": ["/analyze", "/chat", "/health"]
+    }
 
 @app.get("/health")
 @app.head("/health")
@@ -200,30 +244,43 @@ async def health():
 @app.post("/analyze", response_model=AnalyzeResponse)
 async def analyze(req: AnalyzeRequest):
     raw_url = req.url.strip()
+    
+    if not raw_url:
+        raise HTTPException(status_code=400, detail="URL не может быть пустым")
+    
     url = normalize_url(raw_url)
-    logger.info(f"📊 Analyzing URL: {url}")
+    logger.info(f"📊 Анализ URL: {url}")
 
     if not is_valid_url(url):
-        raise HTTPException(status_code=400, detail="Invalid URL")
+        raise HTTPException(status_code=400, detail="Некорректный URL")
 
     try:
         html, final_url = await fetch_html_best_effort(url)
+        
+        if not html or len(html) < 100:
+            raise HTTPException(status_code=400, detail="Получен пустой или слишком короткий контент")
+        
         data = extract_main_content(html, final_url)
-        if not data["text"]:
-            raise HTTPException(status_code=400, detail="No meaningful content found on the site")
+        
+        if not data["text"] or len(data["text"]) < 50:
+            raise HTTPException(status_code=400, detail="Не удалось извлечь осмысленный контент с сайта")
 
         document = smart_truncate(data["text"], max_chars=2800)
+        
+        logger.info(f"✅ Анализ завершен: {len(document)} символов")
+        
         return AnalyzeResponse(
             url=final_url,
             document=document,
             company_name=data["company_name"],
             lang=data["lang"],
         )
+        
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"❌ Analysis error: {e}", exc_info=True)
-        raise HTTPException(status_code=502, detail="Failed to fetch or parse the site")
+        logger.error(f"❌ Ошибка анализа: {e}", exc_info=True)
+        raise HTTPException(status_code=502, detail=f"Не удалось обработать сайт: {str(e)[:200]}")
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
@@ -233,25 +290,49 @@ async def chat(req: ChatRequest):
     lang = (req.lang or "ru").strip().split("-")[0]
 
     if not question:
-        raise HTTPException(status_code=400, detail="Question is empty")
+        raise HTTPException(status_code=400, detail="Вопрос не может быть пустым")
+    
     if not document:
-        raise HTTPException(status_code=400, detail="Document is empty. Вызовите /analyze и передайте документ сюда.")
+        raise HTTPException(
+            status_code=400, 
+            detail="Документ пуст. Сначала вызовите /analyze для получения контента сайта."
+        )
 
-    # Приветствие
-    q = question.lower()
-    if any(w in q for w in ["привет", "здрав", "hi", "hello", "hey"]):
+    logger.info(f"💬 Chat запрос: {question[:100]}...")
+
+    # Проверка на приветствие
+    q_lower = question.lower()
+    greeting_words = ["привет", "здравствуй", "здрав", "hi", "hello", "hey", "добрый день", "доброе утро", "добрый вечер"]
+    
+    if any(word in q_lower for word in greeting_words):
         if lang == "en":
-            welcome = f"Hi! I'm the AI assistant for {company_name}. How can I help you today?"
+            welcome = f"Hi! I'm Silvia, the AI assistant for {company_name}. How can I help you today?"
         else:
-            welcome = f"Здравствуйте! Я — цифровой помощник компании {company_name}. Чем могу помочь?"
+            welcome = f"Здравствуйте! Я — Сильвия, цифровой помощник компании «{company_name}». Чем могу помочь?"
         return ChatResponse(answer=welcome)
 
-    system_prompt = f"""Вы — Silvia, интеллектуальный цифровой сотрудник компании «{company_name}».
-Отвечайте ТОЛЬКО на основе информации с главной страницы компании.
+    # Системный промпт
+    if lang == "en":
+        system_prompt = f"""You are Silvia, an intelligent digital assistant for "{company_name}".
+Answer ONLY based on the information from the company's website provided below.
+
+Rules:
+1) Tone: friendly and professional.
+2) Don't make up facts. If there's no data, say: "I don't have that information, but I can check with the team!"
+3) Don't say "The website says...". You ARE the voice of the company.
+4) Keep answers brief (1-3 sentences) but helpful.
+5) For off-topic questions, politely redirect to company-related topics.
+
+Context (don't quote directly):
+{document}
+"""
+    else:
+        system_prompt = f"""Вы — Сильвия, интеллектуальный цифровой помощник компании «{company_name}».
+Отвечайте ТОЛЬКО на основе информации с сайта компании, предоставленной ниже.
 
 Правила:
-1) Тон: дружелюбно и профессионально.
-2) Не выдумывайте фактов. Если данных нет — скажите: «Этого нет на сайте, но я могу уточнить у команды!».
+1) Тон: дружелюбный и профессиональный.
+2) Не выдумывайте факты. Если данных нет — скажите: «Этой информации нет на сайте, но я могу уточнить у команды!»
 3) Не говорите «На сайте написано…». Вы — голос компании.
 4) Ответы краткие (1–3 предложения), но полезные.
 5) Вопросы не по теме — мягко возвращайте к тематике компании.
@@ -271,9 +352,24 @@ async def chat(req: ChatRequest):
             max_tokens=300,
             top_p=0.9,
         )
-        answer = chat_resp.choices[0].message.content.strip() if chat_resp.choices else "Извините, не удалось сгенерировать ответ."
+        
+        answer = chat_resp.choices[0].message.content.strip() if chat_resp.choices else ""
+        
+        if not answer:
+            answer = "Извините, не удалось сгенерировать ответ. Попробуйте переформулировать вопрос."
+        
+        logger.info(f"✅ Ответ сгенерирован: {len(answer)} символов")
         return ChatResponse(answer=answer)
 
     except Exception as e:
-        logger.error(f"❌ Chat error: {e}", exc_info=True)
-        raise HTTPException(status_code=503, detail="LLM временно недоступен, повторите попытку")
+        logger.error(f"❌ Ошибка чата: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=503, 
+            detail="Сервис временно недоступен. Попробуйте через несколько секунд."
+        )
+
+
+# --- Запуск (для локальной разработки) ---
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
