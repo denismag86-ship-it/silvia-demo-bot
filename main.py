@@ -1,32 +1,47 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-import httpx
-from bs4 import BeautifulSoup
+import os
 import re
 import time
+import json
 import hashlib
-import os
 import logging
+from typing import Optional
+
+import httpx
+from bs4 import BeautifulSoup
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import AsyncOpenAI
-import chromadb
+from upstash_redis.asyncio import Redis
 
 # --- Логирование ---
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("silvia")
 
 # --- Конфигурация ---
+SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "3600"))
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise ValueError("Требуется переменная окружения OPENAI_API_KEY")
 
-COLLECTION_NAME = "demo_sites"
-SESSION_TTL_SECONDS = 3600
+UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL")
+UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
+if not UPSTASH_URL or not UPSTASH_TOKEN:
+    raise ValueError("Требуются UPSTASH_REDIS_REST_URL и UPSTASH_REDIS_REST_TOKEN")
 
-# --- Pydantic модели (СНАЧАЛА!) ---
+ALLOWED_ORIGINS = [
+    "https://silvia-ai.ru",
+    "https://www.silvia-ai.ru",
+    "http://localhost:8000",
+    "http://localhost:3000",
+]
+
+# --- Клиенты ---
+client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+redis = Redis(url=UPSTASH_URL, token=UPSTASH_TOKEN)
+
+# --- Модели ---
 class AnalyzeRequest(BaseModel):
     url: str
 
@@ -41,120 +56,59 @@ class ChatResponse(BaseModel):
     answer: str
 
 # --- Инициализация FastAPI ---
-app = FastAPI(
-    title="Silvia API",
-    version="1.0.0",
-    description="AI-powered website assistant"
-)
+app = FastAPI(title="Silvia API", version="1.2.0")
 
-# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://silvia-ai.ru",
-        "https://www.silvia-ai.ru",
-        "http://localhost:8000",
-        "http://localhost:3000",
-    ],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# OpenAI клиент
-client = AsyncOpenAI(api_key=OPENAI_API_KEY)
-
-# ChromaDB клиент (глобальная переменная)
-chroma_client = None
-
-# --- Инициализация ChromaDB ---
-@app.on_event("startup")
-async def startup_event():
-    """Инициализация при запуске приложения"""
-    global chroma_client
-    try:
-        # ✅ Для PRODUCTION: сохранение данных на диск
-        chroma_client = chromadb.PersistentClient(path="./chroma_db")
-        
-        # ИЛИ для разработки без сохранения:
-        # chroma_client = chromadb.EphemeralClient()
-        
-        logger.info("✅ ChromaDB initialized successfully")
-        
-        # Проверяем/создаем коллекцию
-        try:
-            collection = chroma_client.get_or_create_collection(name=COLLECTION_NAME)
-            logger.info(f"✅ Collection '{COLLECTION_NAME}' ready, items: {collection.count()}")
-        except Exception as e:
-            logger.error(f"❌ Collection error: {e}")
-            
-    except Exception as e:
-        logger.error(f"❌ ChromaDB initialization failed: {e}")
-        chroma_client = None
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Очистка при остановке приложения"""
-    logger.info("🛑 Application shutting down...")
-
-# --- Вспомогательные функции ---
-def get_collection():
-    """Безопасное получение коллекции с обработкой ошибок"""
-    if not chroma_client:
-        raise HTTPException(status_code=503, detail="ChromaDB not available")
-    
-    try:
-        return chroma_client.get_or_create_collection(name=COLLECTION_NAME)
-    except Exception as e:
-        logger.error(f"❌ Collection error: {e}")
-        raise HTTPException(status_code=503, detail=f"Database error: {str(e)}")
+# --- Утилиты ---
+def normalize_url(url: str) -> str:
+    u = url.strip()
+    if not re.match(r"^https?://", u, flags=re.I):
+        u = "https://" + u  # по умолчанию https
+    return u
 
 def is_valid_url(url: str) -> bool:
-    """Проверка валидности URL"""
     try:
-        result = httpx.URL(url)
-        return result.scheme in ("http", "https") and bool(result.host)
+        parsed = httpx.URL(url)
+        return parsed.scheme in ("http", "https") and bool(parsed.host)
     except Exception:
         return False
 
 def generate_session_id(url: str) -> str:
-    """Генерация уникального ID сессии на основе URL"""
     return hashlib.sha256(url.encode()).hexdigest()[:16]
 
-def extract_main_content(html: str, url: str) -> dict:
-    """Извлекает только основной контент сайта, удаляя шум."""
+def extract_main_content(html: str, url: str):
     soup = BeautifulSoup(html, "lxml")
-    
+
     # Удаляем шум
     for tag in soup(["script", "style", "nav", "footer", "aside", "header", "form", "button", "img", "svg", "noscript"]):
         tag.decompose()
-    
-    # Ищем основной контент
-    main = soup.find("main") or soup.find("article") or soup.find("section") or soup.body
-    if main:
-        text = main.get_text(separator=" ", strip=True)
-    else:
-        text = soup.get_text(separator=" ", strip=True)
-    
-    # Очистка пробелов
+
+    main = soup.find("main") or soup.find("article") or soup.find("section") or (soup.body if soup else None)
+    text = (main or soup).get_text(separator=" ", strip=True) if soup else ""
     text = re.sub(r"\s+", " ", text).strip()
-    
-    # Метаданные
-    title = soup.title.string if soup.title else ""
+
+    title = ""
+    if soup and soup.title and soup.title.string:
+        title = soup.title.string.strip()
     company_name = title or url.split("//")[-1].split("/")[0]
-    lang = soup.html.get("lang", "ru") if soup.html else "ru"
-    
-    return {
-        "text": text,
-        "company_name": company_name,
-        "lang": lang
-    }
+
+    lang = "ru"
+    if soup and soup.html and soup.html.get("lang"):
+        lang = soup.html.get("lang").lower()
+    lang = lang.split("-")[0]  # en-US -> en
+
+    return {"text": text, "company_name": company_name, "lang": lang}
 
 def smart_truncate(text: str, max_chars: int = 2800) -> str:
-    """Обрезает текст до последнего полного предложения."""
     if len(text) <= max_chars:
         return text
-    
     truncated = text[:max_chars]
     last_end = max(
         truncated.rfind(". "),
@@ -162,173 +116,144 @@ def smart_truncate(text: str, max_chars: int = 2800) -> str:
         truncated.rfind("? "),
         truncated.rfind(".\n"),
     )
-    
     if last_end != -1:
         return truncated[:last_end + 1]
-    
     return truncated[:max_chars]
 
 # --- Эндпоинты ---
 @app.get("/")
 @app.head("/")
 async def root():
-    """Health check endpoint"""
     return {
         "status": "ok",
         "service": "Silvia API",
-        "version": "1.0.0",
+        "version": "1.2.0",
         "endpoints": ["/analyze", "/chat", "/health"]
     }
 
 @app.get("/health")
 @app.head("/health")
 async def health():
-    """Detailed health check"""
-    chroma_status = "disconnected"
-    collection_count = 0
-    
+    redis_status = "disconnected"
     try:
-        if chroma_client:
-            collection = get_collection()
-            collection_count = collection.count()
-            chroma_status = "connected"
+        pong = await redis.ping()
+        redis_status = f"connected: {pong}"
     except Exception as e:
-        chroma_status = f"error: {str(e)}"
-    
+        redis_status = f"error: {e}"
+
     return {
         "status": "healthy",
-        "chromadb": chroma_status,
-        "collection_items": collection_count,
-        "openai": "configured" if OPENAI_API_KEY else "missing"
+        "redis": redis_status,
+        "openai": "configured" if OPENAI_API_KEY else "missing",
     }
 
 @app.post("/analyze", response_model=AnalyzeResponse)
 async def analyze(req: AnalyzeRequest):
-    """Анализ сайта и создание сессии"""
-    url = req.url.strip()
+    raw_url = req.url.strip()
+    url = normalize_url(raw_url)
     logger.info(f"📊 Analyzing URL: {url}")
-    
+
     if not is_valid_url(url):
-        raise HTTPException(status_code=400, detail="Invalid URL format")
-    
+        raise HTTPException(status_code=400, detail="Invalid URL")
+
     session_id = generate_session_id(url)
-    
+    session_key = f"sess:{session_id}"
+
     try:
-        # Получаем HTML
-        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as http_client:
-            resp = await http_client.get(url)
-            resp.raise_for_status()
+        headers = {
+            "User-Agent": "Mozilla/5.0 SilviaBot/1.0 (+https://silvia-ai.ru)",
+            "Accept-Language": "ru,en;q=0.9",
+        }
+        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as http_client:
+            try:
+                resp = await http_client.get(url, headers=headers)
+                resp.raise_for_status()
+            except Exception:
+                # fallback на http, если https не открылся
+                if url.startswith("https://"):
+                    url_http = "http://" + url[len("https://"):]
+                    resp = await http_client.get(url_http, headers=headers)
+                    resp.raise_for_status()
+                    url = url_http
+                else:
+                    raise
             html = resp.text
-        
+
         logger.info(f"✅ HTML fetched: {len(html)} chars")
-        
-        # Извлекаем контент
+
         data = extract_main_content(html, url)
         raw_text = data["text"]
-        
-        if not raw_text or len(raw_text) < 50:
-            raise HTTPException(
-                status_code=400,
-                detail="No meaningful content found on the site"
-            )
-        
+        if not raw_text:
+            raise HTTPException(status_code=400, detail="No meaningful content found on the site")
+
         logger.info(f"📝 Extracted text: {len(raw_text)} chars")
-        
-        # Обрезаем до безопасного размера
+
         safe_text = smart_truncate(raw_text, max_chars=2800)
         logger.info(f"✂️ Truncated to: {len(safe_text)} chars")
-        
-        # Генерируем эмбеддинг
-        embedding_resp = await client.embeddings.create(
-            input=safe_text,
-            model="text-embedding-3-small"
-        )
-        embedding = embedding_resp.data[0].embedding
-        logger.info(f"🧠 Embedding created: {len(embedding)} dimensions")
-        
-        # Сохраняем в ChromaDB
-        collection = get_collection()
-        collection.upsert(
-            ids=[session_id],
-            embeddings=[embedding],
-            documents=[safe_text],
-            metadatas=[{
-                "url": url,
-                "company_name": data["company_name"],
-                "lang": data["lang"],
-                "created_at": int(time.time())
-            }]
-        )
-        
+
+        session_data = {
+            "url": url,
+            "company_name": data["company_name"],
+            "lang": data["lang"],
+            "document": safe_text,
+            "created_at": int(time.time()),
+        }
+
+        # Сохраняем с TTL
+        await redis.set(session_key, json.dumps(session_data), ex=SESSION_TTL_SECONDS)
+
         logger.info(f"✅ Session created: {session_id}")
         return AnalyzeResponse(session_id=session_id)
-    
+
     except httpx.HTTPError as e:
         logger.error(f"❌ HTTP error: {e}")
-        raise HTTPException(
-            status_code=502,
-            detail=f"Failed to fetch URL: {str(e)}"
-        )
+        raise HTTPException(status_code=502, detail=f"Failed to fetch URL: {str(e)}")
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"❌ Analysis error: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Analysis error: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Analysis error: {str(e)}")
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
-    """Чат с AI на основе контента сайта"""
-    session_id = req.session_id
-    question = req.question.strip()
-    
-    logger.info(f"💬 Chat request: session={session_id}, question={question[:50]}...")
-    
+    session_id = (req.session_id or "").strip()
+    question = (req.question or "").strip()
+    logger.info(f"💬 Chat request: session={session_id}, question={question[:80]}...")
+
+    if not session_id:
+        raise HTTPException(status_code=400, detail="Missing session_id")
     if not question:
         raise HTTPException(status_code=400, detail="Question is empty")
-    
+
     try:
-        collection = get_collection()
-        results = collection.get(ids=[session_id])
-        
-        if not results["ids"]:
-            raise HTTPException(
-                status_code=404,
-                detail="Session not found. Please analyze the website first."
-            )
-        
-        # Проверка срока действия сессии
-        created_at = results["metadatas"][0]["created_at"]
-        if time.time() - created_at > SESSION_TTL_SECONDS:
-            collection.delete(ids=[session_id])
-            raise HTTPException(
-                status_code=410,
-                detail="Session expired. Please analyze the website again."
-            )
-        
-        document = results["documents"][0]
-        company_name = results["metadatas"][0]["company_name"]
-        lang = results["metadatas"][0]["lang"]
+        session_key = f"sess:{session_id}"
+        payload_raw = await redis.get(session_key)
+        if not payload_raw:
+            raise HTTPException(status_code=404, detail="Session not found or expired")
 
-        # Приветствие
-        if lang == "en":
-            welcome = f"Hi! I'm the AI assistant for {company_name}. How can I help you today?"
-        else:
-            welcome = f"Здравствуйте! Я — цифровой помощник компании {company_name}. Чем могу помочь?"
+        payload = json.loads(payload_raw)
+        document = payload.get("document", "")
+        company_name = payload.get("company_name", "вашей компании")
+        lang = payload.get("lang", "ru")
 
-        if len(question) < 10 and any(w in question.lower() for w in ["прив", "hi", "hello", "здрав", "hey"]):
+        # Простое приветствие
+        q = question.lower()
+        if any(w in q for w in ["привет", "здрав", "hi", "hello", "hey"]):
+            if lang == "en":
+                welcome = f"Hi! I'm the AI assistant for {company_name}. How can I help you today?"
+            else:
+                welcome = f"Здравствуйте! Я — цифровой помощник компании {company_name}. Чем могу помочь?"
             return ChatResponse(answer=welcome)
 
-        # Системный промпт
-        system_prompt = f"""Вы — Silvia, интеллектуальный цифровой сотрудник компании «{company_name}». 
-Ваша задача — отвечать от лица компании, используя ТОЛЬКО информацию с её главной страницы.
+        system_prompt = f"""Вы — Silvia, интеллектуальный цифровой сотрудник компании «{company_name}».
+Отвечайте ТОЛЬКО на основе информации с главной страницы компании.
 
 Правила:
-1. Говорите дружелюбно, профессионально и с лёгкой креативностью.
-2. НЕ выдумывайте факты. Если информации нет — скажите: «Это не указано на сайте, но я могу уточнить у команды!»
-3. Избегайте фраз вроде «На сайте написано…». Вы — голос компании.
-4. Ответы — краткие (1–3 предложения), но полезные.
-5. Если вопрос не по теме — мягко верните в контекст.
+1) Тон: дружелюбно и профессионально.
+2) Не выдумывайте фактов. Если данных нет — скажите: «Этого нет на сайте, но я могу уточнить у команды!».
+3) Не говорите «На сайте написано…». Вы — голос компании.
+4) Ответы краткие (1–3 предложения), но полезные.
+5) Вопросы не по теме — мягко возвращайте к тематике компании.
 
 Контекст (не цитируйте дословно):
 {document}
@@ -338,54 +263,19 @@ async def chat(req: ChatRequest):
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": question}
+                {"role": "user", "content": question},
             ],
             temperature=0.75,
             max_tokens=300,
-            top_p=0.9
+            top_p=0.9,
         )
-        
-        answer = chat_resp.choices[0].message.content.strip()
+
+        answer = chat_resp.choices[0].message.content.strip() if chat_resp.choices else "Извините, не удалось сгенерировать ответ."
         logger.info(f"✅ Answer generated: {len(answer)} chars")
-        
         return ChatResponse(answer=answer)
-        
+
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"❌ Chat error: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Generation error: {str(e)}"
-        )
-
-# --- Дополнительный эндпоинт для очистки старых сессий (опционально) ---
-@app.delete("/sessions/cleanup")
-async def cleanup_sessions():
-    """Удаление истекших сессий"""
-    try:
-        collection = get_collection()
-        all_items = collection.get()
-        
-        if not all_items["ids"]:
-            return {"deleted": 0, "message": "No sessions to clean"}
-        
-        current_time = time.time()
-        expired_ids = []
-        
-        for idx, metadata in enumerate(all_items["metadatas"]):
-            if current_time - metadata["created_at"] > SESSION_TTL_SECONDS:
-                expired_ids.append(all_items["ids"][idx])
-        
-        if expired_ids:
-            collection.delete(ids=expired_ids)
-            logger.info(f"🧹 Cleaned {len(expired_ids)} expired sessions")
-        
-        return {
-            "deleted": len(expired_ids),
-            "remaining": collection.count()
-        }
-        
-    except Exception as e:
-        logger.error(f"❌ Cleanup error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Generation error: {str(e)}")
