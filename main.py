@@ -10,10 +10,12 @@ import logging
 from pydantic import BaseModel
 from openai import AsyncOpenAI
 import chromadb
-from chromadb.config import Settings
 
 # --- Логирование ---
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 # --- Конфигурация ---
@@ -24,8 +26,26 @@ if not OPENAI_API_KEY:
 COLLECTION_NAME = "demo_sites"
 SESSION_TTL_SECONDS = 3600
 
+# --- Pydantic модели (СНАЧАЛА!) ---
+class AnalyzeRequest(BaseModel):
+    url: str
+
+class AnalyzeResponse(BaseModel):
+    session_id: str
+
+class ChatRequest(BaseModel):
+    session_id: str
+    question: str
+
+class ChatResponse(BaseModel):
+    answer: str
+
 # --- Инициализация FastAPI ---
-app = FastAPI(title="Silvia API", version="1.0.0")
+app = FastAPI(
+    title="Silvia API",
+    version="1.0.0",
+    description="AI-powered website assistant"
+)
 
 # CORS
 app.add_middleware(
@@ -41,18 +61,41 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# OpenAI клиент
 client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-# 🔥 ChromaDB — ИСПРАВЛЕНИЕ: Защита от потери данных при перезапуске
-try:
-    chroma_client = chromadb.Client(Settings(
-        anonymized_telemetry=False,
-        allow_reset=True,
-    ))
-    logger.info("✅ ChromaDB initialized (in-memory mode)")
-except Exception as e:
-    logger.error(f"❌ ChromaDB initialization failed: {e}")
-    chroma_client = None
+# ChromaDB клиент (глобальная переменная)
+chroma_client = None
+
+# --- Инициализация ChromaDB ---
+@app.on_event("startup")
+async def startup_event():
+    """Инициализация при запуске приложения"""
+    global chroma_client
+    try:
+        # ✅ Для PRODUCTION: сохранение данных на диск
+        chroma_client = chromadb.PersistentClient(path="./chroma_db")
+        
+        # ИЛИ для разработки без сохранения:
+        # chroma_client = chromadb.EphemeralClient()
+        
+        logger.info("✅ ChromaDB initialized successfully")
+        
+        # Проверяем/создаем коллекцию
+        try:
+            collection = chroma_client.get_or_create_collection(name=COLLECTION_NAME)
+            logger.info(f"✅ Collection '{COLLECTION_NAME}' ready, items: {collection.count()}")
+        except Exception as e:
+            logger.error(f"❌ Collection error: {e}")
+            
+    except Exception as e:
+        logger.error(f"❌ ChromaDB initialization failed: {e}")
+        chroma_client = None
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Очистка при остановке приложения"""
+    logger.info("🛑 Application shutting down...")
 
 # --- Вспомогательные функции ---
 def get_collection():
@@ -64,14 +107,10 @@ def get_collection():
         return chroma_client.get_or_create_collection(name=COLLECTION_NAME)
     except Exception as e:
         logger.error(f"❌ Collection error: {e}")
-        # Пытаемся пересоздать коллекцию при ошибке
-        try:
-            chroma_client.delete_collection(name=COLLECTION_NAME)
-        except:
-            pass
-        return chroma_client.create_collection(name=COLLECTION_NAME)
+        raise HTTPException(status_code=503, detail=f"Database error: {str(e)}")
 
 def is_valid_url(url: str) -> bool:
+    """Проверка валидности URL"""
     try:
         result = httpx.URL(url)
         return result.scheme in ("http", "https") and bool(result.host)
@@ -79,33 +118,43 @@ def is_valid_url(url: str) -> bool:
         return False
 
 def generate_session_id(url: str) -> str:
+    """Генерация уникального ID сессии на основе URL"""
     return hashlib.sha256(url.encode()).hexdigest()[:16]
 
-def extract_main_content(html: str, url: str):
+def extract_main_content(html: str, url: str) -> dict:
     """Извлекает только основной контент сайта, удаляя шум."""
     soup = BeautifulSoup(html, "lxml")
     
+    # Удаляем шум
     for tag in soup(["script", "style", "nav", "footer", "aside", "header", "form", "button", "img", "svg", "noscript"]):
         tag.decompose()
     
+    # Ищем основной контент
     main = soup.find("main") or soup.find("article") or soup.find("section") or soup.body
     if main:
         text = main.get_text(separator=" ", strip=True)
     else:
         text = soup.get_text(separator=" ", strip=True)
     
+    # Очистка пробелов
     text = re.sub(r"\s+", " ", text).strip()
     
+    # Метаданные
     title = soup.title.string if soup.title else ""
     company_name = title or url.split("//")[-1].split("/")[0]
     lang = soup.html.get("lang", "ru") if soup.html else "ru"
     
-    return {"text": text, "company_name": company_name, "lang": lang}
+    return {
+        "text": text,
+        "company_name": company_name,
+        "lang": lang
+    }
 
 def smart_truncate(text: str, max_chars: int = 2800) -> str:
     """Обрезает текст до последнего полного предложения."""
     if len(text) <= max_chars:
         return text
+    
     truncated = text[:max_chars]
     last_end = max(
         truncated.rfind(". "),
@@ -113,8 +162,10 @@ def smart_truncate(text: str, max_chars: int = 2800) -> str:
         truncated.rfind("? "),
         truncated.rfind(".\n"),
     )
+    
     if last_end != -1:
         return truncated[:last_end + 1]
+    
     return truncated[:max_chars]
 
 # --- Эндпоинты ---
@@ -133,29 +184,32 @@ async def root():
 @app.head("/health")
 async def health():
     """Detailed health check"""
-    chroma_status = "connected" if chroma_client else "disconnected"
+    chroma_status = "disconnected"
+    collection_count = 0
     
-    # Проверяем, что коллекция доступна
     try:
         if chroma_client:
             collection = get_collection()
-            chroma_status = f"connected, collection: {collection.count()}"
+            collection_count = collection.count()
+            chroma_status = "connected"
     except Exception as e:
         chroma_status = f"error: {str(e)}"
     
     return {
         "status": "healthy",
         "chromadb": chroma_status,
+        "collection_items": collection_count,
         "openai": "configured" if OPENAI_API_KEY else "missing"
     }
 
 @app.post("/analyze", response_model=AnalyzeResponse)
 async def analyze(req: AnalyzeRequest):
+    """Анализ сайта и создание сессии"""
     url = req.url.strip()
     logger.info(f"📊 Analyzing URL: {url}")
     
     if not is_valid_url(url):
-        raise HTTPException(status_code=400, detail="Invalid URL")
+        raise HTTPException(status_code=400, detail="Invalid URL format")
     
     session_id = generate_session_id(url)
     
@@ -172,8 +226,11 @@ async def analyze(req: AnalyzeRequest):
         data = extract_main_content(html, url)
         raw_text = data["text"]
         
-        if not raw_text:
-            raise HTTPException(status_code=400, detail="No meaningful content found on the site")
+        if not raw_text or len(raw_text) < 50:
+            raise HTTPException(
+                status_code=400,
+                detail="No meaningful content found on the site"
+            )
         
         logger.info(f"📝 Extracted text: {len(raw_text)} chars")
         
@@ -183,7 +240,7 @@ async def analyze(req: AnalyzeRequest):
         
         # Генерируем эмбеддинг
         embedding_resp = await client.embeddings.create(
-            input=safe_text, 
+            input=safe_text,
             model="text-embedding-3-small"
         )
         embedding = embedding_resp.data[0].embedding
@@ -208,13 +265,20 @@ async def analyze(req: AnalyzeRequest):
     
     except httpx.HTTPError as e:
         logger.error(f"❌ HTTP error: {e}")
-        raise HTTPException(status_code=502, detail=f"Failed to fetch URL: {str(e)}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to fetch URL: {str(e)}"
+        )
     except Exception as e:
         logger.error(f"❌ Analysis error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Analysis error: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Analysis error: {str(e)}"
+        )
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
+    """Чат с AI на основе контента сайта"""
     session_id = req.session_id
     question = req.question.strip()
     
@@ -228,12 +292,19 @@ async def chat(req: ChatRequest):
         results = collection.get(ids=[session_id])
         
         if not results["ids"]:
-            raise HTTPException(status_code=404, detail="Session not found")
+            raise HTTPException(
+                status_code=404,
+                detail="Session not found. Please analyze the website first."
+            )
         
+        # Проверка срока действия сессии
         created_at = results["metadatas"][0]["created_at"]
         if time.time() - created_at > SESSION_TTL_SECONDS:
             collection.delete(ids=[session_id])
-            raise HTTPException(status_code=410, detail="Session expired")
+            raise HTTPException(
+                status_code=410,
+                detail="Session expired. Please analyze the website again."
+            )
         
         document = results["documents"][0]
         company_name = results["metadatas"][0]["company_name"]
@@ -245,10 +316,10 @@ async def chat(req: ChatRequest):
         else:
             welcome = f"Здравствуйте! Я — цифровой помощник компании {company_name}. Чем могу помочь?"
 
-        if len(question) < 5 and any(w in question.lower() for w in ["прив", "hi", "hello", "здрав"]):
+        if len(question) < 10 and any(w in question.lower() for w in ["прив", "hi", "hello", "здрав", "hey"]):
             return ChatResponse(answer=welcome)
 
-        # Системный промт
+        # Системный промпт
         system_prompt = f"""Вы — Silvia, интеллектуальный цифровой сотрудник компании «{company_name}». 
 Ваша задача — отвечать от лица компании, используя ТОЛЬКО информацию с её главной страницы.
 
@@ -273,26 +344,48 @@ async def chat(req: ChatRequest):
             max_tokens=300,
             top_p=0.9
         )
+        
         answer = chat_resp.choices[0].message.content.strip()
         logger.info(f"✅ Answer generated: {len(answer)} chars")
+        
         return ChatResponse(answer=answer)
         
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"❌ Chat error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Generation error: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Generation error: {str(e)}"
+        )
 
-# Модели остаются без изменений
-class AnalyzeRequest(BaseModel):
-    url: str
-
-class AnalyzeResponse(BaseModel):
-    session_id: str
-
-class ChatRequest(BaseModel):
-    session_id: str
-    question: str
-
-class ChatResponse(BaseModel):
-    answer: str
+# --- Дополнительный эндпоинт для очистки старых сессий (опционально) ---
+@app.delete("/sessions/cleanup")
+async def cleanup_sessions():
+    """Удаление истекших сессий"""
+    try:
+        collection = get_collection()
+        all_items = collection.get()
+        
+        if not all_items["ids"]:
+            return {"deleted": 0, "message": "No sessions to clean"}
+        
+        current_time = time.time()
+        expired_ids = []
+        
+        for idx, metadata in enumerate(all_items["metadatas"]):
+            if current_time - metadata["created_at"] > SESSION_TTL_SECONDS:
+                expired_ids.append(all_items["ids"][idx])
+        
+        if expired_ids:
+            collection.delete(ids=expired_ids)
+            logger.info(f"🧹 Cleaned {len(expired_ids)} expired sessions")
+        
+        return {
+            "deleted": len(expired_ids),
+            "remaining": collection.count()
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Cleanup error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
