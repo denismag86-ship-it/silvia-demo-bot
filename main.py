@@ -3,7 +3,6 @@ import re
 import time
 import logging
 from typing import Optional
-import asyncio
 
 import httpx
 from bs4 import BeautifulSoup
@@ -27,14 +26,16 @@ if not OPENAI_API_KEY:
 SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "3600"))
 ALLOW_JINA_FALLBACK = os.getenv("ALLOW_JINA_FALLBACK", "1") == "1"
 
-# 🔧 ИСПРАВЛЕНИЕ 1: Более гибкие CORS для теста
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "").split(",") if os.getenv("ALLOWED_ORIGINS") else [
+# 🔧 ИСПРАВЛЕНИЕ 1: Добавьте все возможные варианты вашего фронтенда
+ALLOWED_ORIGINS = [
     "https://silvia-ai.ru",
     "https://www.silvia-ai.ru",
+    "http://silvia-ai.ru",
+    "http://www.silvia-ai.ru",
     "http://localhost:8000",
     "http://localhost:3000",
-    "http://127.0.0.1:3000",
     "http://127.0.0.1:8000",
+    "http://127.0.0.1:3000",
 ]
 
 # --- Клиенты ---
@@ -60,29 +61,34 @@ class ChatResponse(BaseModel):
     answer: str
 
 # --- Инициализация FastAPI ---
-app = FastAPI(title="Silvia API (stateless)", version="2.0.0")
+app = FastAPI(title="Silvia API (stateless)", version="2.0.1")
 
-# 🔧 ИСПРАВЛЕНИЕ 2: Улучшенный CORS
+# 🔧 ИСПРАВЛЕНИЕ 2: Временно разрешите все origins для теста
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # ⚠️ Для продакшена верните обратно ALLOWED_ORIGINS
+    allow_origins=["*"],  # ⚠️ ДЛЯ ТЕСТА! Потом верните ALLOWED_ORIGINS
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["*"],
 )
 
-# 🔧 ИСПРАВЛЕНИЕ 3: Middleware для логирования запросов
+# 🔧 ИСПРАВЛЕНИЕ 3: Middleware для логирования ВСЕХ запросов
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    logger.info(f"📨 {request.method} {request.url.path} от {request.client.host}")
     start = time.time()
+    
+    # Логируем входящий запрос
+    logger.info(f"📨 {request.method} {request.url.path} от {request.client.host}")
+    logger.info(f"   Headers: Origin={request.headers.get('origin')}, Content-Type={request.headers.get('content-type')}")
     
     try:
         response = await call_next(request)
         duration = time.time() - start
+        
         logger.info(f"✅ {request.method} {request.url.path} → {response.status_code} ({duration:.2f}s)")
         return response
+        
     except Exception as e:
         duration = time.time() - start
         logger.error(f"❌ {request.method} {request.url.path} → ERROR ({duration:.2f}s): {e}")
@@ -154,18 +160,14 @@ UA_LIST = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
 ]
 
-# 🔧 ИСПРАВЛЕНИЕ 4: Сокращенные таймауты и меньше попыток
 async def fetch_html_best_effort(url: str) -> tuple[str, str]:
-    """
-    Возвращает (html, final_url). Быстрые попытки.
-    """
     async with httpx.AsyncClient(
-        timeout=15.0,  # ⚠️ Сокращено с 30 до 15 секунд
+        timeout=20.0,  # Сокращено для быстрого ответа
         follow_redirects=True,
         verify=False
     ) as http_client:
         
-        # Попытка 1: Только 1 User-Agent (вместо 3)
+        # Только 1 попытка для скорости
         headers = {
             "User-Agent": UA_LIST[0],
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -182,46 +184,33 @@ async def fetch_html_best_effort(url: str) -> tuple[str, str]:
             
             logger.warning(f"⚠️ Статус {r.status_code}")
                 
-        except httpx.TimeoutException:
-            logger.warning(f"⏱️ Таймаут для {url}")
         except Exception as e:
             logger.error(f"❌ Ошибка: {e}")
 
-        # Попытка 2: HTTP fallback
+        # HTTP fallback
         if url.startswith("https://"):
             alt_url = url.replace("https://", "http://", 1)
-            logger.info(f"🔄 HTTP fallback: {alt_url}")
-            
             try:
-                r = await http_client.get(alt_url, headers=headers, timeout=10.0)
+                r = await http_client.get(alt_url, headers=headers, timeout=15.0)
                 if r.status_code < 400 and r.text.strip():
-                    logger.info(f"✅ HTTP fallback OK")
                     return r.text, alt_url
-            except Exception as e:
-                logger.warning(f"❌ HTTP fallback failed: {e}")
+            except:
+                pass
 
-        # Попытка 3: Jina AI
+        # Jina AI fallback
         if ALLOW_JINA_FALLBACK:
             try:
-                logger.info(f"🤖 Jina AI fallback...")
                 jina_url = f"https://r.jina.ai/{url}"
-                
-                jr = await http_client.get(jina_url, headers=headers, timeout=15.0)
+                jr = await http_client.get(jina_url, headers=headers, timeout=20.0)
                 
                 if jr.status_code < 400 and jr.text.strip():
-                    logger.info(f"✅ Jina OK")
                     safe_text = jr.text.replace("<", "&lt;").replace(">", "&gt;")
                     html = f"<html><head><title>Content</title></head><body><main>{safe_text}</main></body></html>"
                     return html, url
-                    
-            except Exception as e:
-                logger.warning(f"❌ Jina failed: {e}")
+            except:
+                pass
 
-    logger.error(f"💥 Все попытки провалились для {url}")
-    raise HTTPException(
-        status_code=503,  # 503 вместо 403 (более корректно)
-        detail="Не удалось загрузить сайт. Попробуйте другой URL или повторите позже."
-    )
+    raise HTTPException(status_code=503, detail="Не удалось загрузить сайт")
 
 # --- Эндпоинты ---
 @app.get("/")
@@ -243,18 +232,27 @@ async def health():
         "time": int(time.time()),
     }
 
-# 🔧 ИСПРАВЛЕНИЕ 5: Тестовый эндпоинт для проверки POST
-@app.post("/test")
-async def test_post(request: Request):
-    body = await request.json()
-    logger.info(f"🧪 Test POST получен: {body}")
-    return {"status": "ok", "received": body, "timestamp": int(time.time())}
+# 🔧 ИСПРАВЛЕНИЕ 4: Тестовый эндпоинт
+@app.post("/test-chat")
+async def test_chat(request: Request):
+    """Тестовый эндпоинт для проверки, доходят ли POST запросы"""
+    try:
+        body = await request.json()
+        logger.info(f"🧪 TEST-CHAT получил: {body}")
+        return {
+            "status": "ok",
+            "received": body,
+            "message": "Backend работает! Проблема в frontend."
+        }
+    except Exception as e:
+        logger.error(f"❌ TEST-CHAT error: {e}")
+        return {"status": "error", "detail": str(e)}
 
 @app.post("/analyze", response_model=AnalyzeResponse)
 async def analyze(req: AnalyzeRequest):
     raw_url = req.url.strip()
     
-    logger.info(f"📊 ANALYZE START: {raw_url}")
+    logger.info(f"📊 ANALYZE START: '{raw_url}'")
     
     if not raw_url:
         raise HTTPException(status_code=400, detail="URL не может быть пустым")
@@ -277,7 +275,7 @@ async def analyze(req: AnalyzeRequest):
 
         document = smart_truncate(data["text"], max_chars=2800)
         
-        logger.info(f"✅ ANALYZE OK: {len(document)} символов, компания: {data['company_name']}")
+        logger.info(f"✅ ANALYZE OK: {len(document)} символов, компания: '{data['company_name']}'")
         
         return AnalyzeResponse(
             url=final_url,
@@ -289,7 +287,7 @@ async def analyze(req: AnalyzeRequest):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"💥 ANALYZE ERROR: {e}", exc_info=True)
+        logger.error(f"❌ ANALYZE ERROR: {e}", exc_info=True)
         raise HTTPException(status_code=502, detail=f"Ошибка: {str(e)[:200]}")
 
 @app.post("/chat", response_model=ChatResponse)
@@ -299,7 +297,12 @@ async def chat(req: ChatRequest):
     company_name = (req.company_name or "вашей компании").strip()
     lang = (req.lang or "ru").strip().split("-")[0]
 
-    logger.info(f"💬 CHAT START: '{question[:100]}'")
+    # 🔧 ИСПРАВЛЕНИЕ 5: Детальное логирование
+    logger.info(f"💬 CHAT START")
+    logger.info(f"   Question: '{question[:100]}'")
+    logger.info(f"   Document length: {len(document)}")
+    logger.info(f"   Company: '{company_name}'")
+    logger.info(f"   Lang: '{lang}'")
 
     if not question:
         raise HTTPException(status_code=400, detail="Вопрос не может быть пустым")
@@ -317,7 +320,7 @@ async def chat(req: ChatRequest):
         else:
             welcome = f"Здравствуйте! Я — Сильвия, помощник {company_name}. Чем могу помочь?"
         
-        logger.info(f"✅ CHAT: приветствие")
+        logger.info(f"✅ CHAT: приветствие отправлено")
         return ChatResponse(answer=welcome)
 
     # Системный промпт
@@ -329,6 +332,8 @@ async def chat(req: ChatRequest):
 """
 
     try:
+        logger.info(f"🤖 Отправка в OpenAI...")
+        
         chat_resp = await client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
@@ -345,10 +350,12 @@ async def chat(req: ChatRequest):
             answer = "Извините, не удалось сгенерировать ответ."
         
         logger.info(f"✅ CHAT OK: {len(answer)} символов")
+        logger.info(f"   Answer: '{answer[:100]}'")
+        
         return ChatResponse(answer=answer)
 
     except Exception as e:
-        logger.error(f"💥 CHAT ERROR: {e}", exc_info=True)
+        logger.error(f"❌ CHAT ERROR: {e}", exc_info=True)
         raise HTTPException(status_code=503, detail="OpenAI временно недоступен")
 
 
