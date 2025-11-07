@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Демо Silvia AI</title>
+    <style>
+        /* СТИЛИ ВИДЖЕТА (полностью автономные) */
+        #chat-widget {
+            max-width: 400px;
+            margin: 20px auto;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            border-radius: 12px;
+            overflow: hidden;
+            background: white;
+        }
+        
+        .header {
+            background: linear-gradient(135deg, #6a11cb 0%, #2575fc 100%);
+            color: white;
+            padding: 15px;
+            text-align: center;
+        }
+        
+        #demo-input-block, #loading-block, #demo-chat-block {
+            padding: 20px;
+        }
+        
+        input[type="text"] {
+            width: 100%;
+            padding: 12px;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            font-size: 16px;
+            margin: 8px 0;
+            box-sizing: border-box;
+        }
+        
+        button {
+            background: #007bff;
+            color: white;
+            border: none;
+            padding: 12px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 16px;
+            width: 100%;
+            transition: background 0.3s;
+        }
+        
+        button:hover {
+            background: #0069d9;
+        }
+        
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+        
+        #loading-block {
+            display: none;
+            text-align: center;
+        }
+        
+        .spinner {
+            border: 4px solid rgba(0, 0, 0, 0.1);
+            border-radius: 50%;
+            border-top: 4px solid #007bff;
+            width: 40px;
+            height: 40px;
+            margin: 20px auto;
+            animation: spin 1s linear infinite;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        #chat-messages {
+            height: 300px;
+            overflow-y: auto;
+            border: 1px solid #eee;
+            border-radius: 8px;
+            padding: 15px;
+            margin: 15px 0;
+            background: #f9f9f9;
+        }
+        
+        .chat-message {
+            margin-bottom: 15px;
+            max-width: 85%;
+            padding: 12px 15px;
+            border-radius: 18px;
+            line-height: 1.4;
+        }
+        
+        .bot {
+            background: #e9ecef;
+            align-self: flex-start;
+            border-bottom-left-radius: 5px;
+        }
+        
+        .user {
+            background: #d1ecf1;
+            margin-left: auto;
+            border-bottom-right-radius: 5px;
+        }
+        
+        #cta-block {
+            padding: 0 20px 20px;
+            display: none;
+        }
+        
+        #cta-block button {
+            background: linear-gradient(135deg, #ff8a00 0%, #da1b60 100%);
+        }
+    </style>
+</head>
+<body>
+    <div id="chat-widget">
+        <div class="header">
+            <h2>🤖 Silvia AI Demo</h2>
+            <p>Анализ сайта и ответы в реальном времени</p>
+        </div>
+        
+        <div id="demo-input-block">
+            <input type="text" id="user-site-url" placeholder="Введите URL сайта (например, example.com)">
+            <button id="analyze-btn">Проанализировать</button>
+        </div>
+        
+        <div id="loading-block">
+            <p>Анализирую контент сайта...</p>
+            <div class="spinner"></div>
+            <p style="color: #6c757d; font-size: 14px;">Это демо. В реальной версии здесь анализируются страницы, метаданные и контент</p>
+        </div>
+        
+        <div id="demo-chat-block">
+            <p style="color: #6c757d; margin-bottom: 10px;">Анализируемый сайт: <strong><span id="analyzed-site-url"></span></strong></p>
+            <div id="chat-messages"></div>
+            <input type="text" id="user-question" placeholder="Задайте любой вопрос по сайту...">
+            <button id="send-question-btn">Отправить вопрос</button>
+        </div>
+        
+        <div id="cta-block">
+            <button onclick="window.open('https://silvia-ai.ru', '_blank')">Получить полную версию</button>
+        </div>
+    </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            // КЛИЕНТСКАЯ ЛОГИКА (полностью без сервера)
+            let sessionData = null;
+            const demoResponses = [
+                "✅ На сайте есть все основные разделы: услуги, контакты, о компании. Рекомендую добавить отзывы клиентов на главную страницу.",
+                "🔍 Заметил, что на странице услуг нет детального описания процесса работы. Добавьте этапы выполнения заказов.",
+                "💡 В футере сайта хорошо бы разместить быстрые ссылки на популярные услуги — это снизит показатель отказов.",
+                "📊 Страница контактов содержит все необходимые данные, но отсутствует интерактивная карта. Добавьте Яндекс.Карты для удобства.",
+                "🚀 Скорость загрузки главной страницы в норме. Для улучшения SEO рекомендую добавить alt-атрибуты для всех изображений."
+            ];
+
+            // DOM элементы
+            const elements = {
+                siteInput: document.getElementById('user-site-url'),
+                questionInput: document.getElementById('user-question'),
+                analyzeBtn: document.getElementById('analyze-btn'),
+                sendBtn: document.getElementById('send-question-btn'),
+                demoInput: document.getElementById('demo-input-block'),
+                loading: document.getElementById('loading-block'),
+                chatBlock: document.getElementById('demo-chat-block'),
+                ctaBlock: document.getElementById('cta-block'),
+                messages: document.getElementById('chat-messages'),
+                siteUrlDisplay: document.getElementById('analyzed-site-url')
+            };
+
+            // Обработчики событий
+            elements.analyzeBtn.addEventListener('click', analyzeSite);
+            elements.sendBtn.addEventListener('click', sendMessage);
+            elements.questionInput.addEventListener('keypress', (e) => {
+                if (e.key === 'Enter' && !e.shiftKey) sendMessage();
+            });
+
+            // Функция анализа сайта
+            function analyzeSite() {
+                const url = elements.siteInput.value.trim();
+                if (!url) return alert('⚠️ Пожалуйста, введите URL сайта');
+                
+                // Простая валидация URL
+                const isValidUrl = url.match(/^(https?:\/\/)?(www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b([-a-zA-Z0-9()@:%_\+.~#?&//=]*)$/);
+                if (!isValidUrl) return alert('❌ Некорректный формат URL. Пример: example.com');
+
+                // Показать загрузку
+                elements.demoInput.style.display = 'none';
+                elements.loading.style.display = 'block';
+
+                // Эмуляция анализа (1.5 секунды)
+                setTimeout(() => {
+                    sessionData = {
+                        url: url.startsWith('http') ? url : `https://${url}`,
+                        timestamp: new Date().toISOString()
+                    };
+                    
+                    // Обновить интерфейс
+                    elements.siteUrlDisplay.textContent = sessionData.url;
+                    elements.loading.style.display = 'none';
+                    elements.chatBlock.style.display = 'block';
+                    elements.ctaBlock.style.display = 'block';
+                    
+                    // Первое сообщение бота
+                    addMessage('bot', `🎉 Сайт успешно проанализирован!\n\nЗдравствуйте! Я — Silvia, цифровой помощник для анализа сайтов. Я изучил содержимое ${sessionData.url} и готов ответить на ваши вопросы.`);
+                }, 1500);
+            }
+
+            // Функция отправки сообщения
+            function sendMessage() {
+                if (!sessionData) {
+                    alert('⚠️ Сначала проанализируйте сайт!');
+                    elements.siteInput.focus();
+                    return;
+                }
+
+                const question = elements.questionInput.value.trim();
+                if (!question) return;
+
+                // Показать сообщение пользователя
+                addMessage('user', question);
+                elements.questionInput.value = '';
+                toggleInputState(true);
+
+                // Эмуляция ответа ИИ (через 0.8 секунды)
+                setTimeout(() => {
+                    const randomResponse = demoResponses[
+                        Math.floor(Math.random() * demoResponses.length)
+                    ].replace("сайте", `сайте ${new URL(sessionData.url).hostname}`);
+                    
+                    addMessage('bot', randomResponse);
+                    toggleInputState(false);
+                }, 800);
+            }
+
+            // Вспомогательные функции
+            function toggleInputState(disabled) {
+                elements.questionInput.disabled = disabled;
+                elements.sendBtn.disabled = disabled;
+                if (!disabled) elements.questionInput.focus();
+            }
+
+            function addMessage(role, text) {
+                const msg = document.createElement('div');
+                msg.className = `chat-message ${role}`;
+                msg.innerHTML = text.replace(/\n/g, '<br>');
+                elements.messages.appendChild(msg);
+                elements.messages.scrollTop = elements.messages.scrollHeight;
+            }
+        });
+    </script>
+</body>
+</html>
