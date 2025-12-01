@@ -9,7 +9,7 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI  # Используем тот же SDK!
 
 # --- 1. Логирование ---
 logging.basicConfig(
@@ -19,14 +19,21 @@ logging.basicConfig(
 logger = logging.getLogger("silvia")
 
 # --- 2. Конфигурация ---
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    logger.warning("⚠️ Переменная OPENAI_API_KEY не найдена! Чат работать не будет.")
+# 👇 Изменено: теперь читаем DEEPSEEK_API_KEY
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+if not DEEPSEEK_API_KEY:
+    logger.warning("⚠️ Переменная DEEPSEEK_API_KEY не найдена! Чат работать не будет.")
+
+# 👇 Базовый URL DeepSeek API
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+
+# 👇 Модель: deepseek-chat (V3) или deepseek-reasoner (R1)
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 
 ALLOW_JINA_FALLBACK = os.getenv("ALLOW_JINA_FALLBACK", "1") == "1"
 
 # --- 3. Инициализация FastAPI ---
-app = FastAPI(title="Silvia API", version="2.2.0")
+app = FastAPI(title="Silvia API", version="2.3.0")  # Обновил версию
 
 # --- 4. Настройка CORS ---
 origins = [
@@ -49,10 +56,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- 5. Клиенты ---
-client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+# --- 5. Клиент DeepSeek (через OpenAI SDK) ---
+# 👇 Ключевое изменение: указываем base_url и api_key для DeepSeek
+client = AsyncOpenAI(
+    api_key=DEEPSEEK_API_KEY,
+    base_url=DEEPSEEK_BASE_URL,
+)
 
-# --- 6. Модели данных (Pydantic) ---
+# --- 6. Модели данных (Pydantic) --- (без изменений)
 
 class AnalyzeRequest(BaseModel):
     url: str
@@ -63,30 +74,27 @@ class AnalyzeResponse(BaseModel):
     company_name: str
     lang: str
 
-# 👇 Новая модель для одного сообщения в истории
 class Message(BaseModel):
-    role: str     # "user" или "assistant"
+    role: str
     content: str
 
 class ChatRequest(BaseModel):
     question: str
     document: str
-    # 👇 Новый список истории. По умолчанию пустой.
-    history: List[Message] = [] 
+    history: List[Message] = []
     company_name: Optional[str] = None
     lang: Optional[str] = None
 
 class ChatResponse(BaseModel):
     answer: str
 
-# --- 7. Middleware для логирования ---
+# --- 7. Middleware для логирования --- (без изменений)
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     start = time.time()
     path = request.url.path
     method = request.method
     
-    # Логируем только начало важных запросов, чтобы не засорять
     if path in ["/chat", "/analyze"]:
         logger.info(f"📨 {method} {path} от {request.client.host}")
     
@@ -101,7 +109,7 @@ async def log_requests(request: Request, call_next):
         logger.error(f"❌ {method} {path} → ERROR ({duration:.2f}s): {e}")
         raise
 
-# --- 8. Утилиты ---
+# --- 8. Утилиты --- (без изменений, пропускаю для краткости)
 def normalize_url(url: str) -> str:
     u = url.strip()
     if not re.match(r"^https?://", u, flags=re.I):
@@ -188,19 +196,25 @@ async def fetch_html_best_effort(url: str) -> tuple[str, str]:
 
 @app.get("/")
 async def root():
-    return {"service": "Silvia AI API", "status": "running"}
+    return {
+        "service": "Silvia AI API",
+        "status": "running",
+        "model": DEEPSEEK_MODEL,  # 👈 Добавил для отладки
+    }
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "provider": "deepseek"}
 
 @app.post("/analyze", response_model=AnalyzeResponse)
 async def analyze(req: AnalyzeRequest):
     raw_url = req.url.strip()
-    if not raw_url: raise HTTPException(400, "URL пустой")
+    if not raw_url:
+        raise HTTPException(400, "URL пустой")
     
     url = normalize_url(raw_url)
-    if not is_valid_url(url): raise HTTPException(400, "Некорректный URL")
+    if not is_valid_url(url):
+        raise HTTPException(400, "Некорректный URL")
 
     try:
         html, final_url = await fetch_html_best_effort(url)
@@ -217,7 +231,8 @@ async def analyze(req: AnalyzeRequest):
             company_name=data["company_name"],
             lang=data["lang"],
         )
-    except HTTPException: raise
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Analyze error: {e}")
         raise HTTPException(502, f"Ошибка анализа: {str(e)}")
@@ -228,8 +243,6 @@ async def chat(req: ChatRequest):
     document = req.document.strip()
     company_name = req.company_name or "Компании"
     
-    # Получаем историю и ограничиваем её (последние 6 сообщений), 
-    # чтобы не отправлять слишком много текста и не тратить токены
     history_messages = req.history[-6:] if req.history else []
     
     if not question or not document:
@@ -241,24 +254,21 @@ async def chat(req: ChatRequest):
 Отвечай вежливо, кратко и по делу. Учитывай предыдущий контекст беседы.
 
 База знаний:
-{document[:3500]} 
+{document[:3500]}
 """
 
-    # Формируем список сообщений для OpenAI
     messages_payload = [{"role": "system", "content": system_prompt}]
     
-    # Добавляем историю диалога
     for msg in history_messages:
-        # Защита: разрешаем только роли user и assistant
         if msg.role in ["user", "assistant"]:
             messages_payload.append({"role": msg.role, "content": msg.content})
             
-    # Добавляем текущий вопрос
     messages_payload.append({"role": "user", "content": question})
 
     try:
+        # 👇 Единственное изменение — модель
         chat_resp = await client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=DEEPSEEK_MODEL,  # deepseek-chat или deepseek-reasoner
             messages=messages_payload,
             temperature=0.6,
             max_tokens=400,
@@ -268,7 +278,7 @@ async def chat(req: ChatRequest):
         return ChatResponse(answer=answer)
 
     except Exception as e:
-        logger.error(f"OpenAI error: {e}")
+        logger.error(f"DeepSeek error: {e}")
         raise HTTPException(status_code=503, detail="Ошибка AI")
 
 if __name__ == "__main__":
